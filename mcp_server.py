@@ -70,6 +70,7 @@ TOOLS = [
             "source itself, transcribes it, finds the most viral moments with AI "
             "and renders vertical (9:16) clips. Captions and the AI hook line are "
             "burned by default; pass captions=false or auto_hook=false to skip either. "
+            "Each clip also opens with a short cold-open teaser unless teaser=false. "
             "Takes the URL as the user gave it; the video does not need to be "
             "opened or transcribed beforehand. Returns a job_id immediately — the work takes minutes; "
             "poll get_job_status or pass webhook_url to be called back. The "
@@ -108,6 +109,16 @@ TOOLS = [
                                    "when the source already has subtitles burned in (they would "
                                    "stack) or the user wants clean clips; add_subtitles can still "
                                    "caption a clip later.",
+                },
+                "teaser": {
+                    "type": "boolean",
+                    "description": "Default true: open each clip with its most gripping ~3 s moment "
+                                   "as a cold open. Set false to skip it.",
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Creator instructions for this video: content rules, hook and "
+                                   "caption style. Max 1500 characters.",
                 },
                 "confirm_rights": {
                     "type": "boolean",
@@ -311,6 +322,75 @@ TOOLS = [
         },
     },
     {
+        "name": "get_transcript",
+        "title": "Read a job's full transcript",
+        "description": (
+            "Read the whole transcript of a processed job's ORIGINAL video, in "
+            "source seconds, to choose clip boundaries by meaning (where a "
+            "thought starts and lands) before calling create_clip or "
+            "recut_clip. Pass start/end to fetch only a slice of a long video, "
+            "and words=true for word timings to place exact cut points. A "
+            "silent source returns no segments and a note."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "words": {"type": "boolean",
+                          "description": "Also return word timings [{w, s, e}] for the range (default false)."},
+                "start": {"type": "number", "description": "Slice start, seconds in the source video."},
+                "end": {"type": "number", "description": "Slice end, seconds in the source video."},
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "create_clip",
+        "title": "Create a new clip from source segments",
+        "description": (
+            "Render a brand-new clip from source-video segments you chose (e.g. "
+            "from get_transcript) and append it to the job's clips; existing "
+            "clips are untouched. Times are seconds in the ORIGINAL source; "
+            "segments are joined in the given order. Needs the retained source "
+            "video and re-runs the reframe engine. Returns the new clip_index "
+            "and a download_url."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {"type": "number", "description": "Seconds in the source video."},
+                            "end": {"type": "number", "description": "Seconds in the source video."},
+                        },
+                        "required": ["start", "end"],
+                    },
+                    "minItems": 1,
+                    "description": "Ordered source segments the new clip is made of.",
+                },
+                "title": {"type": "string", "description": "Clip title (max 120 characters)."},
+                "snap_to_words": {
+                    "type": "boolean",
+                    "description": "Snap each boundary onto transcript word boundaries (default true).",
+                },
+                "reapply_captions": {
+                    "type": "boolean",
+                    "description": "Burn default captions onto the new clip (default true).",
+                },
+                "framing": {
+                    "type": "string", "enum": ["auto", "full", "track"],
+                    "description": "'full' shows the whole source frame, 'track' forces the "
+                                   "subject-tracking crop, 'auto' (default) lets the AI pick.",
+                },
+            },
+            "required": ["job_id", "segments"],
+        },
+    },
+    {
         "name": "publish_clip",
         "title": "Publish a clip to social platforms",
         "description": (
@@ -351,6 +431,9 @@ _ANNOTATIONS = {
     "add_subtitles": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     # Replaces the clip's current render with the new cut.
     "recut_clip": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "get_transcript": _READ,
+    # Only appends a clip; nothing existing is replaced.
+    "create_clip": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     "publish_clip": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 }
 for _tool in TOOLS:
@@ -394,16 +477,17 @@ async def _tool_process_video(client, args):
         "webhook_url": args.get("webhook_url"),
         "webhook_secret": args.get("webhook_secret"),
     }
-    for k in ("target_clips", "clip_min_seconds", "clip_max_seconds", "captions"):
+    for k in ("target_clips", "clip_min_seconds", "clip_max_seconds", "captions", "teaser", "brief"):
         if args.get(k) is not None:
             body[k] = args[k]
-    # Same default as the dashboard: hook on unless the caller opts out. The
-    # REST endpoint keeps "absent = off" for older integrations; the MCP
-    # tool is newer than the hook and its users expect the dashboard output.
+    # Hook on unless the caller opts out (the REST endpoint defaults to on too,
+    # so the opt-out is sent explicitly).
     if args.get("auto_hook", True):
         body["auto_hook"] = True
         if args.get("hook_style"):
             body["auto_hook_style"] = args["hook_style"]
+    else:
+        body["auto_hook"] = False
     resp = await client.post("/api/process", json=body)
     if resp.status_code >= 400:
         return _api_error(resp), True
@@ -577,6 +661,29 @@ async def _tool_recut_clip(client, args):
     return _with_download_url(resp.json()), False
 
 
+async def _tool_get_transcript(client, args):
+    params = {"words": "true" if args.get("words") else "false"}
+    for k in ("start", "end"):
+        if args.get(k) is not None:
+            params[k] = args[k]
+    resp = await _job_call(client, "GET", f"/api/jobs/{args['job_id']}/transcript",
+                           args["job_id"], params=params)
+    if resp.status_code >= 400:
+        return _api_error(resp), True
+    return resp.json(), False
+
+
+async def _tool_create_clip(client, args):
+    body = {"job_id": args["job_id"], "segments": args["segments"]}
+    for k in ("title", "snap_to_words", "reapply_captions", "framing"):
+        if args.get(k) is not None:
+            body[k] = args[k]
+    resp = await _job_call(client, "POST", "/api/clip/create", args["job_id"], json=body)
+    if resp.status_code >= 400:
+        return _api_error(resp), True
+    return _with_download_url(resp.json()), False
+
+
 async def _tool_publish_clip(client, args):
     body = {"job_id": args["job_id"], "clip_index": args["clip_index"],
             "platforms": args["platforms"]}
@@ -597,6 +704,8 @@ _TOOL_IMPLS = {
     "get_quota": _tool_get_quota,
     "add_subtitles": _tool_add_subtitles,
     "recut_clip": _tool_recut_clip,
+    "get_transcript": _tool_get_transcript,
+    "create_clip": _tool_create_clip,
     "publish_clip": _tool_publish_clip,
 }
 

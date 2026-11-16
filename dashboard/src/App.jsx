@@ -25,12 +25,16 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import ClipHistory from './components/ClipHistory';
+import StorageBanner from './components/StorageBanner';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT } from './lib/api';
 import { track } from './lib/analytics';
+import { retryJob } from './lib/jobRetry';
+import RetryPanel from './components/RetryPanel';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -95,6 +99,20 @@ const isAutoProfileId = (username) => /^os_[0-9a-f]/i.test(username || "");
  * user is doing now. File uploads cannot be serialised (a File is not JSON), so
  * those are only resumed within the same document, via the in-memory fallback. */
 const PENDING_JOB_KEY = 'os_pending_job';
+
+// Local change: models selectable in Settings ('' = server default). Keep in
+// sync with GEMINI_MODEL_CHOICES in app.py. A remembered value off this list
+// (a retired model) falls back to the default instead of failing every job.
+const GEMINI_MODELS = [
+  ['gemini-3-flash-preview', 'gemini-3-flash-preview — better picks'],
+  ['gemini-3.5-flash', 'gemini-3.5-flash — best picks, ~6x cost'],
+];
+const savedGeminiModel = () => {
+  try {
+    const saved = localStorage.getItem('gemini_model') || '';
+    return GEMINI_MODELS.some(([value]) => value === saved) ? saved : '';
+  } catch { return ''; }
+};
 const PENDING_JOB_TTL_MS = 60 * 60 * 1000;
 let pendingJobInMemory = null;
 
@@ -288,11 +306,22 @@ function App() {
   const [queueInfo, setQueueInfo] = useState(null);
   // Why the last job could not start or failed, in plain words (or '').
   const [jobError, setJobError] = useState('');
+  // Retry of a failed job: the server's {code, message} and {allowed, used, limit,
+  // reason} from the status poll, the in-flight flag and an inline retry problem.
+  const [jobErrObj, setJobErrObj] = useState(null);
+  const [jobRetry, setJobRetry] = useState(null);
+  const [retrying, setRetrying] = useState(false);
+  const [retryProblem, setRetryProblem] = useState('');
   // Durable R2 URLs (per clip index) for the current job — used as a fallback when
   // the ephemeral local /videos/ files have been cleaned up (e.g. after a reload).
   const [durableClips, setDurableClips] = useState({});
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  // Local change: Gemini model picked in Settings, sent as X-Gemini-Model.
+  const [geminiModel, setGeminiModel] = useState(savedGeminiModel);
+  useEffect(() => {
+    try { localStorage.setItem('gemini_model', geminiModel); } catch { /* storage blocked */ }
+  }, [geminiModel]);
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -835,7 +864,9 @@ function App() {
             refreshMe();
           } else if (data.status === 'failed') {
             setStatus('error');
-            const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
+            setJobErrObj(data.error && typeof data.error === 'object' ? data.error : null);
+            setJobRetry(data.retry || null);
+            const errorMsg = (data.error && typeof data.error === 'object' ? data.error.message : data.error) || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
             setJobError(readableError(errorMsg));
             setLogs(prev => [...prev, "Error: " + errorMsg]);
             clearInterval(interval);
@@ -854,6 +885,19 @@ function App() {
     }
     return () => clearInterval(interval);
   }, [status, jobId, refreshMe]);
+
+  // A failed job restored from localStorage never polls (status is already
+  // 'error'): ask once so the retry panel has its error and attempts record.
+  useEffect(() => {
+    if (status !== 'error' || !jobId || jobRetry || jobErrObj) return undefined;
+    let cancelled = false;
+    pollJob(jobId).then((d) => {
+      if (cancelled || d.status !== 'failed') return;
+      setJobErrObj(d.error && typeof d.error === 'object' ? d.error : null);
+      setJobRetry(d.retry || null);
+    }).catch(() => { /* unknown job: keep today's behaviour */ });
+    return () => { cancelled = true; };
+  }, [status, jobId, jobRetry, jobErrObj]);
 
 
   // silent: background auto-fetch — never alert(), just log. Managed users need
@@ -886,7 +930,8 @@ function App() {
   // A self-hosted server running the moment picker on a local LLM
   // (LLM_BASE_URL) does not need a Gemini key for the core pipeline.
   const geminiOk = !!apiKey || !!localLlm;
-  const keysMissing = !billingEnabled && (!geminiOk || !uploadPostKey);
+  // Local change: Upload-Post is only needed to publish, not to generate clips.
+  const keysMissing = !billingEnabled && !geminiOk;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
@@ -1110,6 +1155,9 @@ function App() {
     clearPendingJob();
     setStatus('processing');
     setJobError('');
+    setJobErrObj(null);
+    setJobRetry(null);
+    setRetryProblem('');
     setLogs(["Starting process..."]);
     setLogTimes([Date.now() / 1000]);
     setResults(null);
@@ -1127,6 +1175,7 @@ function App() {
       // BYOK sends the Gemini header; managed users rely on the bearer token
       // that apiFetch attaches automatically.
       const headers = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+      if (geminiModel) headers['X-Gemini-Model'] = geminiModel;
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
@@ -1138,6 +1187,8 @@ function App() {
         // but the dashboard always states the user's choice.
         auto_hook: data.autoHook ? '1' : '0',
         auto_hook_style: data.autoHook ? (data.autoHookStyle || 'pill') : null,
+        // Cold open is on server-side by default: only switching it off travels.
+        teaser: data.teaser === false ? '0' : null,
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
         // Set when the user took the quota wall's "clip the first N minutes"
@@ -1146,6 +1197,9 @@ function App() {
         // The stretch picked under the cost line (seconds); absent = whole video.
         source_start: data.sourceStart ?? null,
         source_end: data.sourceEnd ?? null,
+        // Creator instructions; absent when the box is empty.
+        brief: data.brief || null,
+        brief_preset_id: data.briefPresetId || null,
       };
 
       if (data.type === 'url') {
@@ -1278,7 +1332,64 @@ function App() {
     setFirstVideoJob(false);
     setQueueInfo(null);
     setJobError('');
+    setJobErrObj(null);
+    setJobRetry(null);
+    setRetryProblem('');
     localStorage.removeItem(SESSION_KEY);
+  };
+
+  // Put the UI back on a job the server has just re-queued, the way
+  // handleProcess does after a successful submit; the polling effect (keyed on
+  // status + jobId) restarts because status flips error -> processing.
+  const attachRetriedJob = (id) => {
+    setActiveTab('dashboard');
+    setJobId(id);
+    setStatus('processing');
+    setJobError('');
+    setJobErrObj(null);
+    setJobRetry(null);
+    setRetryProblem('');
+    setLogs(['Retrying...']);
+    setLogTimes([Date.now() / 1000]);
+    setResults(null);
+    setQualityGate(null);
+    setPartialJob(null);
+    setFirstVideoJob(false);
+    setQueueInfo(null);
+    if (!processingMedia) setProcessingMedia({ type: 'server', payload: `/api/source/${id}` });
+  };
+
+  const handleRetry = async () => {
+    if (retrying || !jobId) return;
+    setRetrying(true);
+    setRetryProblem('');
+    try {
+      await retryJob(jobId, { apiKey, geminiModel });
+      attachRetriedJob(jobId);
+      refreshMe();
+    } catch (e) {
+      if (e instanceof QuotaError) {
+        refreshMe();
+        if (me?.status === 'trialing') {
+          setShowTrialUpgrade(true);
+        } else {
+          setTopUpInfo({ required: e.minutesRequired, remaining: e.minutesRemaining, partialMinutes: 0, onPartial: null });
+          setShowTopUp(true);
+        }
+      } else {
+        setRetryProblem(e?.message || 'Could not retry this video.');
+      }
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  // History row retried: attach to it unless another job is running here.
+  const handleHistoryRetried = (id) => {
+    if (status === 'processing') return 'background';
+    attachRetriedJob(id);
+    refreshMe();
+    return 'attached';
   };
 
   // --- UI Components ---
@@ -1294,7 +1405,7 @@ function App() {
     { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
+    ...(!billingEnabled || isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
@@ -1644,6 +1755,8 @@ function App() {
         {/* Advanced tools (AI Shorts, AI Agent): BYOK fal.ai + ElevenLabs notice. */}
         {advancedThisTab && <AdvancedBanner needsPlan={needsPlan} onKeys={() => goToTab('settings')} />}
 
+        <StorageBanner onManage={() => goToTab('history')} />
+
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
 
@@ -1708,6 +1821,23 @@ function App() {
               ) : (
                 <>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+
+              <div className="card p-4 sm:p-6 mt-8">
+                <h2 className="text-base font-medium text-ink lowercase mb-2">AI model</h2>
+                <p className="text-xs text-muted mb-4 leading-relaxed">
+                  Model that picks the clips. If it's overloaded, the job switches to a backup model automatically.
+                </p>
+                <select
+                  value={geminiModel}
+                  onChange={(e) => setGeminiModel(e.target.value)}
+                  className="input-field"
+                >
+                  <option value="">Default (gemini-3.1-flash-lite) — cheapest</option>
+                  {GEMINI_MODELS.map(([value, label]) => (
+                    <option key={value} value={value}>{label}</option>
+                  ))}
+                </select>
+              </div>
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -2040,7 +2170,8 @@ function App() {
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
-                <HistoryTab onReopenProject={restoreProject} />
+                <ClipHistory apiKey={apiKey} geminiModel={geminiModel} onRetried={handleHistoryRetried} />
+                {billingEnabled && <HistoryTab onReopenProject={restoreProject} />}
               </div>
             </div>
           )}
@@ -2238,7 +2369,7 @@ function App() {
                     <span className="mr-auto">Generated Shorts</span>
                     {results?.clips?.length > 0 && (
                       <span className="readout bg-paper3 px-2.5 py-1 rounded-full">
-                        {results.clips.length} Clips
+                        {results.clips.filter((c) => !c.deleted).length} Clips
                       </span>
                     )}
                     {results?.cost_analysis && !isManaged && (
@@ -2398,7 +2529,7 @@ function App() {
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
                   {results && results.clips && results.clips.length > 0 ? (
                     <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
-                      {rankedClips.map(({ clip, index: i }) => (
+                      {rankedClips.filter(({ clip }) => !clip.deleted).map(({ clip, index: i }) => (
                         <ResultCard
                           key={`${jobId}-${i}-${clip.video_url || ''}`}
                           clip={clip}
@@ -2420,7 +2551,7 @@ function App() {
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                           onBulkSubtitle={handleBulkSubtitles}
-                          clipCount={results.clips.length}
+                          clipCount={results.clips.filter((c) => !c.deleted).length}
                           bulkProgress={bulkSub}
                         />
                       ))}
@@ -2437,6 +2568,14 @@ function App() {
                     ) : status === 'error' ? (
                       <div className="h-full min-h-[120px] flex flex-col items-center justify-center text-danger space-y-2">
                         <p>Generation failed.</p>
+                        <RetryPanel
+                          error={jobErrObj}
+                          fallbackText={jobError}
+                          retry={jobRetry}
+                          busy={retrying}
+                          onRetry={handleRetry}
+                          problem={retryProblem}
+                        />
                       </div>
                     ) : null
                   )}

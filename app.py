@@ -34,6 +34,7 @@ import layout_ranges
 import watermarked
 import media_auth
 from jsonfile import write_json_atomic
+import job_retry
 
 load_dotenv()
 
@@ -133,6 +134,12 @@ BILLING_ENABLED = os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true",
 JOB_RETENTION_SECONDS = int(
     os.environ.get("JOB_RETENTION_SECONDS", "3600" if BILLING_ENABLED else "86400")
 )
+# Self-host keeps every completed clip job (a job dir holding a *_metadata.json,
+# i.e. what History lists) until the user deletes it: neither the age sweep nor
+# the OUTPUT_MAX_GB trim touches it (the cap then only drives the "storage full"
+# warning). Cloud keeps its tight clock (clips live on in R2). HISTORY_KEEP=0
+# restores the old self-host behaviour.
+KEEP_HISTORY = (not BILLING_ENABLED) and os.environ.get("HISTORY_KEEP", "1").strip() != "0"
 # The retained download of a URL job (--keep-original) is the one artifact that
 # is a full copy of someone else's video rather than something we made, so it
 # can be aged out ahead of the clips it produced. Defaults to the job clock,
@@ -166,6 +173,16 @@ else:
 async def _user_from_request(request: Request):
     """Load the authenticated cloud user (or None). Cheap indexed lookup."""
     return await get_current_user_optional(request)
+
+
+# Local change: models selectable from the dashboard Settings page. Keep in
+# sync with GEMINI_MODELS in dashboard/src/App.jsx. A value off this list (a
+# retired model a browser or a stored .submit.json still carries) is ignored
+# everywhere, so the job runs on the default model instead of failing.
+# gemini-2.5-flash / -flash-lite are retired (404 for new users): never re-add.
+# The list lives in clip_selection so main.py validates GEMINI_BOUNDARY_MODEL
+# against the same one (clip_selection.boundary_model_name).
+from clip_selection import GEMINI_MODEL_CHOICES  # noqa: E402
 
 
 async def resolve_gemini(request: Request) -> Optional[str]:
@@ -999,6 +1016,9 @@ def _clips_actually_rendered(job_id, output_dir, base_name, clips):
     ready_files = (jobs.get(job_id) or {}).get('ready_files') or {}
     kept = []
     for i, clip in enumerate(clips):
+        if clip.get('deleted'):
+            kept.append(clip)  # tombstone: keep the slot, there is no file to check
+            continue
         clip_filename = (ready_files.get(i)
                          or _canonical_clip_file(output_dir, base_name, i))
         clip_path = os.path.join(output_dir, clip_filename)
@@ -1319,6 +1339,9 @@ def _recover_jobs_from_disk():
             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
             clips = data.get('shorts', [])
             for i, clip in enumerate(clips):
+                if clip.get('deleted'):
+                    clip.pop('video_url', None)  # tombstone: no URL to a missing file
+                    continue
                 if not clip.get('video_url'):
                     clip['video_url'] = (
                         f"/videos/{job_id}/"
@@ -1676,6 +1699,39 @@ def _clear_resume_manifest(job_id):
         print(f"⚠️ Could not clear resume manifest for {job_id}: {e}")
 
 
+def _hook_style_names():
+    try:
+        from hooks import HOOK_STYLES
+        return tuple(HOOK_STYLES)
+    except Exception:
+        return ()
+
+
+def _apply_submit_settings(env, job_path):
+    """Re-apply a job's allow-listed settings from ``.submit.json`` (job_retry)."""
+    try:
+        job_retry.apply_settings(env, job_retry.read_submit(job_path).get("settings"),
+                                 GEMINI_MODEL_CHOICES, hook_styles=_hook_style_names())
+    except Exception as e:
+        print(f"⚠️ Could not re-apply job settings: {type(e).__name__}")
+
+
+def _record_failure_reason(job_id, job):
+    """Terminal state: keep a failed job's plain reason on disk (.failed.json),
+    drop a stale one when it completed. Never raises."""
+    try:
+        if not job:
+            return
+        out_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
+        if job.get('status') == 'failed':
+            job_retry.write_failed(out_dir, job_retry.classify_failure(
+                _job_error_text(list(job.get('logs') or []))))
+        elif job.get('status') == 'completed':
+            job_retry.clear_failed(out_dir)
+    except Exception as e:
+        print(f"⚠️ Could not record the failure reason for {job_id}: {type(e).__name__}")
+
+
 def _resume_interrupted_jobs() -> set:
     """Re-enqueue jobs that were mid-processing when the server last stopped.
 
@@ -1735,6 +1791,9 @@ def _resume_interrupted_jobs() -> set:
         # Rebuild env from scratch — the manifest holds no secrets. Managed
         # (cloud) jobs get the server key; self-host falls back to its env key.
         env = child_env()
+        # The job's own settings (layouts, hooks, clip controls, model) from
+        # its submit sidecar: without them a resumed job ran on defaults.
+        _apply_submit_settings(env, job_path)
         try:
             from cloud import proxy_ledger as _pl
             if BILLING_ENABLED and _pl.budget_exceeded_sync():
@@ -1831,6 +1890,18 @@ def _upload_job_id(filename: str) -> str:
     return filename.split("_", 1)[0]
 
 
+def _is_kept_job(job_id, job_path) -> bool:
+    """A completed clip job that History keeps until the user deletes it."""
+    if not KEEP_HISTORY:
+        return False
+    if (jobs.get(job_id) or {}).get('status') == 'failed':
+        return False
+    try:
+        return bool(glob.glob(os.path.join(job_path, "*_metadata.json")))
+    except Exception:
+        return False
+
+
 def _sweep_expired_job_dirs(now):
     """Drop job dirs older than JOB_RETENTION_SECONDS, except live jobs."""
     for job_id in os.listdir(OUTPUT_DIR):
@@ -1845,7 +1916,7 @@ def _sweep_expired_job_dirs(now):
             expired = now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS
         except OSError:
             continue
-        if not expired or _job_is_active(job_id, now):
+        if not expired or _job_is_active(job_id, now) or _is_kept_job(job_id, job_path):
             continue
         print(f"🧹 Purging old job: {job_id}")
         shutil.rmtree(job_path, ignore_errors=True)
@@ -1912,7 +1983,8 @@ def _enforce_output_size_cap():
         if job_id == thumbs:
             continue
         p = os.path.join(OUTPUT_DIR, job_id)
-        if os.path.isdir(p) and not _job_is_active(job_id):
+        if (os.path.isdir(p) and not _job_is_active(job_id)
+                and not _is_kept_job(job_id, p)):
             try:
                 candidates.append((os.path.getmtime(p), p, job_id))
             except OSError:
@@ -2138,6 +2210,7 @@ async def run_job_wrapper(job_id):
         # The subprocess returned (success or genuine failure) — a terminal
         # state, so drop the resume manifest. It only survives if the container
         # was killed mid-run, which is exactly when we want to resume.
+        _record_failure_reason(job_id, job)
         _clear_resume_manifest(job_id)
         # Settle the minute reservation (managed jobs only): commit on success,
         # release otherwise so the minutes go back to the user.
@@ -2202,7 +2275,10 @@ def _should_auto_retry(job) -> bool:
 
 def _clean_for_retry(output_dir):
     """Drop the half-made outputs of a failed run; keep the source, the
-    transcript checkpoint (the retry skips transcription), owner and manifest."""
+    transcript checkpoint (the retry skips transcription), owner and manifest,
+    and the job's sidecars (.brief.json, .submit.json: the auto and the manual
+    retry both run from them). A manual retry also drops .failed.json and
+    .brief_applied.json (job_retry.clear_for_manual_retry)."""
     try:
         names = os.listdir(output_dir)
     except OSError:
@@ -2707,6 +2783,12 @@ app.include_router(_mcp_server.router)
 import free_tools as _free_tools
 app.include_router(_free_tools.router)
 
+# Saved creator-brief presets (/api/brief-presets).
+import brief_presets as _brief_presets
+_brief_presets.configure(output_dir=OUTPUT_DIR, billing_enabled=BILLING_ENABLED,
+                         user_resolver=_user_from_request)
+app.include_router(_brief_presets.router)
+
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
 app.add_middleware(
@@ -3002,7 +3084,7 @@ _SENSITIVE_LOG_RE = re.compile(
     r'|player_client|extractor|\bdownload|descarg'
     # AI model / provider / cost / pipeline internals
     r'|gemini|openai|anthropic|\bflash\b|\bmodel\b|token|thinking'
-    r'|\bcost\b|\$\s*[0-9]|scoring window|shortlist',
+    r'|\bcost\b|\$\s*[0-9]|scoring window|shortlist|idea pass',
     re.IGNORECASE,
 )
 
@@ -3319,6 +3401,7 @@ async def get_config():
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
+        "keepHistory": KEEP_HISTORY,
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
@@ -3673,10 +3756,13 @@ async def process_endpoint(
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
+    teaser: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    brief: Optional[str] = Form(None),
+    brief_preset_id: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -3707,10 +3793,34 @@ async def process_endpoint(
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
+        teaser = body.get("teaser")
         upload_id = body.get("upload_id")
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        brief = body.get("brief")
+        brief_preset_id = body.get("brief_preset_id")
+
+    # Creator brief: validated before anything is created or consumed, so a
+    # rejection here leaves no job dir and no upload slot behind. The text only
+    # travels in the job's .brief.json sidecar, never env, argv or the manifest.
+    import creator_brief
+    if brief is not None and brief != "":
+        if not isinstance(brief, str):
+            raise HTTPException(status_code=400, detail="brief must be a string")
+        if len(brief) > creator_brief.MAX_BRIEF_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"brief is longer than {creator_brief.MAX_BRIEF_CHARS} characters")
+    brief = creator_brief.sanitize(brief if isinstance(brief, str) else "")
+    brief_preset_name = None
+    if brief_preset_id not in (None, ""):
+        if not isinstance(brief_preset_id, str):
+            raise HTTPException(status_code=400, detail="brief_preset_id must be a string")
+        _preset = await _brief_presets.get_preset(await _owner_id(request), brief_preset_id)
+        brief_preset_name = _preset["name"]
+        if not brief:
+            brief = creator_brief.sanitize(_preset["brief"])
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -3795,6 +3905,11 @@ async def process_endpoint(
         env["GEMINI_API_KEY"] = api_key # Override with key from request
     else:
         env.pop("GEMINI_API_KEY", None)  # local-LLM job: main.py must not find a stale key
+    # Local change: model picked in Settings (X-Gemini-Model). Allow-listed so
+    # the header can't inject arbitrary values into the job environment.
+    picked_model = (request.headers.get("X-Gemini-Model") or "").strip()
+    if picked_model in GEMINI_MODEL_CHOICES:
+        env["GEMINI_MODEL"] = picked_model
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job
@@ -3809,10 +3924,10 @@ async def process_endpoint(
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
 
-    # Auto-hook: burn each clip's Gemini hook text during the render. Off when
-    # the field is absent, so API/MCP/webhook callers keep their old output
-    # byte-for-byte; the dashboard sends an explicit value either way.
-    if str(auto_hook).lower() in ("1", "true", "yes"):
+    # Auto-hook: burn each clip's Gemini hook text during the render. Hooks are
+    # automatic: ON when the field is absent (dashboard, API, MCP and webhook
+    # callers alike); only an explicit false-like value turns it off.
+    if not (auto_hook is not None and str(auto_hook).lower() in ("0", "false", "no")):
         env["AUTO_HOOK"] = "1"
         from hooks import HOOK_STYLES
         if auto_hook_style in HOOK_STYLES:
@@ -3860,6 +3975,11 @@ async def process_endpoint(
     if captions is not None and str(captions).lower() in ("0", "false", "no"):
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
+
+    # teaser=false: skip the cold-open teaser (default on, see AUTO_TEASER).
+    if teaser is not None and str(teaser).lower() in ("0", "false", "no"):
+        env["AUTO_TEASER"] = "0"
+        print(f"[teaser] job={job_id} off")
 
     input_path = None
     if url:
@@ -4031,6 +4151,25 @@ async def process_endpoint(
         except Exception as e:
             print(f"⚠️ Could not persist job owner for {job_id}: {e}")
 
+    # Creator brief sidecar: the single carrier of the brief (the job dir
+    # survives a resume). A failure must not fail the submit; never log the text.
+    try:
+        if url:
+            _brief_label = url
+        elif upload_slot:
+            _brief_label = os.path.basename(upload_slot.get("filename") or "") or "upload"
+        elif thumb_session:
+            _brief_label = "thumbnail session"
+        else:
+            _brief_label = os.path.basename(file.filename or "") or "upload"
+        creator_brief.write_sidecar(
+            job_output_dir, brief, preset_name=brief_preset_name,
+            source={"kind": attestation["source"], "label": _brief_label})
+        print(f"[brief] job={job_id} chars={len(brief)} "
+              f"preset={'yes' if brief_preset_name else 'no'}")
+    except Exception as e:
+        print(f"⚠️ Could not write creator brief for {job_id}: {type(e).__name__}")
+
     # Resume manifest: enough to re-run this job if the container dies mid-flight
     # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
@@ -4039,6 +4178,16 @@ async def process_endpoint(
                            base_url=api_base, partial=partial,
                            source_cap_minutes=source_cap, skip_statics=skip_statics,
                            via_api_key=jobs[job_id]['via_api_key'])
+    # Submit sidecar (job_retry): what a manual retry and a resume need to run
+    # this job again. Allow-listed settings only; no key, secret or brief.
+    try:
+        job_retry.write_submit(
+            job_output_dir, cmd=cmd, settings=job_retry.pick_settings(env, base=os.environ),
+            priority=priority, webhook_url=webhook_url, base_url=api_base, partial=partial,
+            source_cap_minutes=source_cap, skip_statics=skip_statics,
+            via_api_key=jobs[job_id]['via_api_key'], reservation_id=reservation_id)
+    except Exception as e:
+        print(f"⚠️ Could not write the submit sidecar for {job_id}: {type(e).__name__}")
 
     _enqueue_job(job_id, priority)
 
@@ -4061,7 +4210,7 @@ def _job_view_from_disk(job_id):
         if glob.glob(os.path.join(job_path, "*_metadata.json")):
             _recover_jobs_from_disk()
             return jobs.get(job_id)
-        return None
+        return _lost_job_view(job_id, job_path)
     alive = time.time() - float(m.get("heartbeat") or 0) < HEARTBEAT_STALE_AFTER
     owner = m.get("user_id")
     return {
@@ -4069,6 +4218,27 @@ def _job_view_from_disk(job_id):
         'logs': _TimedLog(["♻️ The server was updated; your video continues on the new instance."]),
         'user_id': (int(owner) if isinstance(owner, str) and owner.isdigit() else owner),
         'result': None,
+    }
+
+
+def _lost_job_view(job_id, job_path):
+    """A real job (it has a submit sidecar) that nobody holds and that never
+    finished: it failed before a restart, or the resume gave up. Answered as
+    failed so the dashboard can offer a retry instead of "job lost". Not put
+    into ``jobs``."""
+    if not _is_uuid_id(job_id):
+        return None
+    if not os.path.isfile(os.path.join(job_path, job_retry.SUBMIT_SIDECAR)):
+        return None
+    raw = _read_owner_marker(job_path)
+    owner = (int(raw) if raw.isdigit() else raw) if raw else None
+    return {
+        'status': 'failed',
+        'logs': _TimedLog(["This video stopped before it finished. You can retry it."]),
+        'output_dir': job_path,
+        'user_id': owner,
+        'result': None,
+        'lost': True,
     }
 
 
@@ -4089,6 +4259,140 @@ def _with_download_urls(result):
             clip = {**clip, 'download_url': _signed_media_url(rel, base)}
         out['clips'].append(clip)
     return out
+
+
+@app.get("/api/clip-history")
+async def clip_history_endpoint(request: Request, limit: int = 20, offset: int = 0):
+    """Each source video with its clips underneath (see clip_history.py)."""
+    import clip_history
+    owner = None
+    if BILLING_ENABLED:
+        user = await _user_from_request(request)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        owner = user.id
+    base = os.environ.get("PUBLIC_API_URL", "").rstrip("/")
+    secret = _media_secret()
+    page = clip_history.build(
+        jobs, owner=owner, scoped=BILLING_ENABLED, limit=limit, offset=offset,
+        sign=lambda rel: _signed_media_url(rel, base) if secret else None,
+        retention_seconds=0 if KEEP_HISTORY else JOB_RETENTION_SECONDS)
+    # Failed or interrupted jobs the user can retry (job_retry).
+    try:
+        page["failed"] = clip_history.failed_jobs(
+            jobs, OUTPUT_DIR, owner=owner, scoped=BILLING_ENABLED,
+            read_reason=lambda jid, job: _failure_reason(jid, job),
+            read_submit=job_retry.read_submit,
+            read_sidecar=clip_history._read_sidecar,
+            is_active=_job_is_active, now=time.time(),
+            retry_info=lambda jid, submit: job_retry.retry_view(
+                jid, OUTPUT_DIR, UPLOAD_DIR, active=_job_is_active(jid), submit=submit))
+    except Exception as e:
+        print(f"⚠️ Could not list failed jobs: {type(e).__name__}")
+        page["failed"] = []
+    return page
+
+
+# --- History storage and delete (self-host usage, owner-scoped deletes) -------
+@app.get("/api/storage")
+async def storage_endpoint():
+    """How full the output directory is, against the existing OUTPUT_MAX_GB cap.
+
+    Self-host only: a multi-tenant server's disk is not for its users. Reports
+    only, jobs are never blocked by it. The directory walk runs in a thread and
+    is cached for a minute (storage_usage).
+    """
+    if BILLING_ENABLED:
+        return {"enabled": False}
+    import storage_usage
+    used = await asyncio.get_event_loop().run_in_executor(
+        None, storage_usage.used_bytes, OUTPUT_DIR, _dir_size)
+    return storage_usage.report(used, OUTPUT_MAX_GB * 1024 ** 3, KEEP_HISTORY)
+
+
+async def _history_job_for_delete(job_id: str, request: Request):
+    """The completed, idle, caller-owned job a History delete may act on."""
+    if not _is_uuid_id(job_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    if BILLING_ENABLED:
+        user = await _user_from_request(request)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+    job = jobs.get(job_id)
+    if job is None:
+        job = _job_view_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if BILLING_ENABLED and job.get('user_id') is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    await _assert_job_owner(request, job)
+    if _job_is_active(job_id) or job.get('status') != 'completed':
+        raise HTTPException(status_code=409, detail="This video is still processing")
+    return job
+
+
+def _history_job_dir(job_id: str):
+    """``OUTPUT_DIR/<job_id>`` once it is proven a direct child of OUTPUT_DIR."""
+    root = os.path.realpath(OUTPUT_DIR)
+    path = os.path.realpath(os.path.join(OUTPUT_DIR, job_id))
+    if os.path.normcase(os.path.dirname(path)) != os.path.normcase(root):
+        raise HTTPException(status_code=404, detail="Not found")
+    return path
+
+
+def _delete_job_files(job_id: str, job_dir: str):
+    """Blocking: the job directory and its source uploads. Local copy only."""
+    shutil.rmtree(job_dir, ignore_errors=True)
+    for path in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(job_id)}_*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def _delete_history_job(job_id: str, job_dir: str):
+    import clip_history
+    import storage_usage
+    await asyncio.get_event_loop().run_in_executor(None, _delete_job_files, job_id, job_dir)
+    jobs.pop(job_id, None)
+    clip_history.forget(job_id)
+    clip_history.invalidate_failed()
+    storage_usage.invalidate()
+
+
+@app.delete("/api/clip-history/{job_id}")
+async def delete_history_job(job_id: str, request: Request):
+    """Delete a whole source video with all its clips (local working copy only:
+    R2 and the database have their own lifecycle in the cloud library)."""
+    await _history_job_for_delete(job_id, request)
+    job_dir = _history_job_dir(job_id)
+    await _delete_history_job(job_id, job_dir)
+    return {"success": True, "deleted": "job", "job_deleted": True}
+
+
+@app.delete("/api/clip-history/{job_id}/clips/{clip_index}")
+async def delete_history_clip(job_id: str, clip_index: int, request: Request):
+    """Delete one clip: its files go, its slot stays as a tombstone so every
+    other clip keeps its index. The last live clip takes the whole job."""
+    import clip_history
+    import storage_usage
+    job = await _history_job_for_delete(job_id, request)
+    job_dir = _history_job_dir(job_id)
+    loop = asyncio.get_event_loop()
+    try:
+        outcome = await loop.run_in_executor(None, clip_history.delete_clip, job_dir, clip_index)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    if outcome == "last":
+        await _delete_history_job(job_id, job_dir)
+        return {"success": True, "deleted": "clip", "job_deleted": True}
+    mem_clips = (job.get('result') or {}).get('clips') or []
+    if 0 <= clip_index < len(mem_clips) and isinstance(mem_clips[clip_index], dict):
+        mem_clips[clip_index]['deleted'] = True
+        mem_clips[clip_index].pop('video_url', None)
+    clip_history.forget(job_id)
+    storage_usage.invalidate()
+    return {"success": True, "deleted": "clip", "job_deleted": False}
 
 
 def _presented_status(job_id, job):
@@ -4122,7 +4426,229 @@ async def get_status(job_id: str, request: Request):
         # Set when only the first part of the source was clipped (quota wall
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
+        # Failed jobs only (null otherwise): a plain reason and whether
+        # POST /api/jobs/{id}/retry may run it again.
+        **_failure_fields(job_id, job),
     }
+
+
+def _failure_reason(job_id, job):
+    """``{"code", "message"}`` for a failed job: its logs, else .failed.json,
+    else "server restarted" for a job no instance holds any more."""
+    job_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
+    if not job.get('lost'):
+        return job_retry.classify_failure(_job_error_text(list(job.get('logs') or [])))
+    return job_retry.read_failed(job_dir) or job_retry.reason("server_restarted")
+
+
+def _failure_fields(job_id, job):
+    if job.get('status') != 'failed':
+        return {"error": None, "retry": None}
+    try:
+        return {"error": _failure_reason(job_id, job),
+                "retry": job_retry.retry_view(job_id, OUTPUT_DIR, UPLOAD_DIR,
+                                              active=_job_is_active(job_id))
+                if _is_uuid_id(job_id) else None}
+    except Exception as e:
+        print(f"⚠️ Could not describe the failure of {job_id}: {type(e).__name__}")
+        return {"error": job_retry.reason("unknown"), "retry": None}
+
+
+# Job ids with a retry request between its first check and its enqueue: a
+# second request for the same job gets 409 instead of a second run.
+_retrying: set = set()
+
+
+def _retry_refused(status, code, message=None):
+    return HTTPException(status_code=status, detail={
+        "code": code, "message": message or job_retry.RETRY_REASONS.get(code, "")})
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: str, request: Request):
+    """Run a failed (or lost) clip job again under the same job id.
+
+    No body. The Gemini key is resolved exactly as on /api/process
+    (``resolve_gemini``: X-Gemini-Key on self-host, the managed key for an
+    entitled cloud user) and ``X-Gemini-Model`` is allow-listed the same way.
+    Everything else comes from the job's ``.submit.json`` (job_retry): argv,
+    settings, priority, webhook URL, partial cut. The creator brief is NOT
+    accepted here: it stays in the job's ``.brief.json`` and main.py reads it
+    from there as on the first run. Cloud jobs reserve their minutes again
+    through ``reserve_process_minutes`` (the failed run's reservation was
+    released by ``_settle_reservation``).
+    """
+    if not _is_uuid_id(job_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    # Claimed before the first await, so two simultaneous requests cannot both
+    # pass the checks below.
+    if job_id in _retrying:
+        raise _retry_refused(409, "running")
+    _retrying.add(job_id)
+    try:
+        return await _retry_job_locked(job_id, request)
+    finally:
+        _retrying.discard(job_id)
+
+
+async def _retry_job_locked(job_id: str, request: Request):
+    import clip_history
+    if BILLING_ENABLED:
+        if await _user_from_request(request) is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+    job = jobs.get(job_id)
+    if job is None:
+        job = _job_view_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if BILLING_ENABLED and job.get('user_id') is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    await _assert_job_owner(request, job)
+    job_dir = _history_job_dir(job_id)
+
+    status = job.get('status')
+    if _job_is_active(job_id) or status in ('queued', 'processing'):
+        raise _retry_refused(409, "running")
+    if status == 'completed':
+        raise _retry_refused(409, "completed", "This video already finished.")
+    if status != 'failed':
+        raise _retry_refused(409, "not_retryable")
+
+    submit = job_retry.read_submit(job_dir)
+    if not submit or not job_retry.cmd_is_safe(submit["cmd"], OUTPUT_DIR, UPLOAD_DIR, job_id):
+        raise _retry_refused(409, "not_retryable")
+    used = submit["retries"]
+    if used >= job_retry.MANUAL_RETRY_LIMIT:
+        raise _retry_refused(429, "limit")
+    source = job_retry.source_of(submit["cmd"])
+    url, input_path = source["url"], source["input_path"]
+    if input_path and not os.path.isfile(input_path):
+        raise _retry_refused(409, "source_missing")
+
+    api_key = await resolve_gemini(request)
+    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
+        raise gemini_missing_error()
+    if url:
+        if DISABLE_YOUTUBE_URL:
+            raise HTTPException(status_code=403, detail="YouTube URL ingest is disabled on this deployment. Please upload a file you own.")
+        await _validate_source_url(url)
+
+    # A failed run's reservation is already released (_settle_reservation);
+    # releasing again is a no-op unless the row is somehow still 'reserved',
+    # in which case it goes back before the new one is taken: never two.
+    stale = job.get('reservation_id') or submit.get("reservation_id")
+    if BILLING_ENABLED and stale:
+        try:
+            await cloud.metering.release_reservation(stale)
+        except Exception as e:
+            print(f"⚠️ Could not release the old reservation of {job_id}: {type(e).__name__}")
+
+    stored_partial = submit.get("partial")
+    source_range = max_minutes = None
+    if stored_partial and stored_partial.get("chosen"):
+        source_range = (stored_partial.get("start_seconds"), stored_partial.get("end_seconds"))
+    elif stored_partial:
+        max_minutes = stored_partial.get("processed_minutes")
+    # Quota / job-limit refusals (402, 429) propagate untouched: nothing has
+    # been changed on disk or in memory yet.
+    user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
+        request, url, input_path, job_id, max_minutes=max_minutes, source_range=source_range)
+    if reservation_id is None:
+        partial = stored_partial
+        priority = submit["priority"] if not BILLING_ENABLED else priority
+    previous = jobs.get(job_id)
+    try:
+        env = child_env()
+        if api_key:
+            env["GEMINI_API_KEY"] = api_key
+        else:
+            env.pop("GEMINI_API_KEY", None)
+        job_retry.apply_settings(env, submit.get("settings"), GEMINI_MODEL_CHOICES,
+                                 hook_styles=_hook_style_names())
+        picked_model = (request.headers.get("X-Gemini-Model") or "").strip()
+        if picked_model in GEMINI_MODEL_CHOICES:
+            env["GEMINI_MODEL"] = picked_model
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        if getattr(request.state, "paid_allowed", True) is False:
+            env.pop("PROXY_URL", None)
+        source_cap = getattr(request.state, "reserved_minutes", None) or submit.get("source_cap_minutes")
+        if url and source_cap and not partial:
+            env["SOURCE_CAP_MINUTES"] = str(source_cap)
+        else:
+            env.pop("SOURCE_CAP_MINUTES", None)
+            source_cap = None
+        skip_statics = bool(url) and bool(getattr(request.state, "skip_statics",
+                                                  submit.get("skip_statics")))
+        if skip_statics:
+            env["DOWNLOAD_SKIP_STATICS"] = "1"
+        else:
+            env.pop("DOWNLOAD_SKIP_STATICS", None)
+        _apply_source_cut(env, partial)
+        if user_plan == "free":
+            env["WATERMARK"] = "1"
+        else:
+            env.pop("WATERMARK", None)
+        cmd = [sys.executable] + list(submit["cmd"][1:])
+        api_base = os.environ.get("PUBLIC_API_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
+        attempt = used + 1
+
+        _clean_for_retry(job_dir)
+        job_retry.clear_for_manual_retry(job_dir)
+        _end_submission(job_id)  # from here the job counts in `jobs` itself
+        jobs[job_id] = {
+            'status': 'queued',
+            'logs': _TimedLog([f"Retrying your video (attempt {attempt} of "
+                               f"{job_retry.MANUAL_RETRY_LIMIT})."]),
+            'cmd': cmd,
+            'env': env,
+            'output_dir': job_dir,
+            'attestation': job.get('attestation'),
+            'user_id': user_id if user_id is not None else job.get('user_id'),
+            'reservation_id': reservation_id,
+            'watermark': env.get("WATERMARK") == "1",
+            'partial': partial,
+            'webhook_url': submit.get("webhook_url"),
+            # Only while the failed record is still in memory: the secret is
+            # never written to .submit.json.
+            'webhook_secret': job.get('webhook_secret'),
+            'base_url': api_base,
+            'user_plan': user_plan,
+            'via_api_key': request_uses_api_key(request),
+            'auto_retries': 0,
+            'manual_retries': attempt,
+        }
+        if user_id is not None:
+            _write_owner_marker(job_dir, user_id)
+        _write_resume_manifest(job_id, cmd, priority, jobs[job_id]['user_id'], reservation_id,
+                               watermark=jobs[job_id]['watermark'],
+                               webhook_url=submit.get("webhook_url"),
+                               webhook_secret=job.get('webhook_secret'), base_url=api_base,
+                               partial=partial, source_cap_minutes=source_cap,
+                               skip_statics=skip_statics,
+                               via_api_key=jobs[job_id]['via_api_key'])
+    except BaseException:
+        _end_submission(job_id)
+        if previous is not None:
+            jobs[job_id] = previous
+        else:
+            jobs.pop(job_id, None)
+        if BILLING_ENABLED and reservation_id:
+            try:
+                await cloud.metering.release_reservation(reservation_id)
+            except Exception:
+                pass
+        raise
+    _enqueue_job(job_id, priority)
+    try:
+        attempt = job_retry.bump_retries(
+            job_dir, reservation_id=None if reservation_id is None else str(reservation_id),
+            settings=job_retry.pick_settings(env, base=os.environ))
+    except Exception as e:
+        print(f"⚠️ Could not update the retry counter of {job_id}: {type(e).__name__}")
+    clip_history.invalidate_failed()
+    print(f"[retry] job={job_id} attempt={attempt}")
+    return {"job_id": job_id, "status": "queued",
+            "retry": {"used": attempt, "limit": job_retry.MANUAL_RETRY_LIMIT}}
 
 
 def _locate_source(job_id: str):
@@ -4272,6 +4798,8 @@ async def download_all_clips(job_id: str, request: Request):
 
     files = []
     for i, clip in enumerate(data.get('shorts', [])):
+        if clip.get('deleted'):
+            continue
         url = None
         if i < len(mem_clips):
             url = (mem_clips[i] or {}).get('video_url')
@@ -4426,6 +4954,9 @@ async def _restore_job_files(job_id: str, proj, user_id: str) -> bool:
         base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
         clips = data.get('shorts', [])
         for i, clip in enumerate(clips):
+            if clip.get('deleted'):
+                clip.pop('video_url', None)
+                continue
             if not clip.get('video_url'):
                 clip['video_url'] = (
                     f"/videos/{job_id}/"
@@ -4926,6 +5457,59 @@ _rerender_locks: Dict[str, asyncio.Lock] = {}
 _scenes_locks: Dict[str, asyncio.Lock] = {}
 
 
+def _resolve_framing(framing):
+    """(framing, force_strategy) for a requested framing; 400 on anything else."""
+    if framing not in _FRAMING_STRATEGIES:
+        raise HTTPException(status_code=400,
+                            detail="framing must be one of: auto, full, track")
+    return framing, _FRAMING_STRATEGIES[framing]
+
+
+def _edl_segments(raw_segments, transcript, source_duration, snap_to_words,
+                  clamp_range=None):
+    """Validate (and optionally word-snap) an EDL; 400 on an invalid one.
+
+    ``clamp_range`` pulls snapped bounds back inside a {start, end} window
+    (the rerender fast path without a source)."""
+    try:
+        segments = recut.normalize_segments(
+            [{"start": s.start, "end": s.end} for s in raw_segments],
+            source_duration)
+        if snap_to_words:
+            snap_bound = source_duration or max(s['end'] for s in segments)
+            segments = recut.snap_segments(segments, transcript, snap_bound)
+            if clamp_range is not None:
+                segments = [
+                    {"start": round(max(s['start'], clamp_range['start']), 3),
+                     "end": round(min(s['end'], clamp_range['end']), 3)}
+                    for s in segments]
+            # Re-validate after snapping/clamping: a segment fully outside the
+            # canonical range clamps to an inverted (end < start) window, and
+            # snapping can stretch the total past the cap. Without this it
+            # reaches ffmpeg and dies as a 500 instead of a clean 400.
+            segments = recut.normalize_segments(segments, source_duration)
+    except recut.RecutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return segments
+
+
+def _source_recut(data, clip, source_path, segments, output_dir, clean_name,
+                  force_strategy, v_transcript):
+    """Cut ``segments`` from the retained source and re-reframe them (the
+    SOURCE path of rerender, and every agent-created clip). The free-plan
+    mark is applied later at delivery (``_deliver``), never here."""
+    return recut.perform_recut(
+        input_path=source_path, segments=segments,
+        output_dir=output_dir, clean_name=clean_name,
+        reframe=True, output_format=data.get('output_format', 'auto'),
+        force_strategy=force_strategy,
+        captions_transcript=v_transcript,
+        captioner=_recut_captioner(clip),
+        # Trim the source's own subtitles only when ours go back on.
+        subtitle_band=(data.get('source_subtitle_band')
+                       if v_transcript else None))
+
+
 @app.post("/api/clip/rerender")
 async def rerender_clip(req: RerenderRequest, request: Request):
     """Re-render a clip from an edited EDL (the clip editor's save button).
@@ -4976,34 +5560,15 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     source_path = _locate_source(req.job_id)
     source_duration = _source_duration_seconds(source_path) if source_path else None
 
-    framing = req.framing or (clip.get('recipe') or {}).get('framing') or 'auto'
-    if framing not in _FRAMING_STRATEGIES:
-        raise HTTPException(status_code=400,
-                            detail="framing must be one of: auto, full, track")
-    force_strategy = _FRAMING_STRATEGIES[framing]
+    framing, force_strategy = _resolve_framing(
+        req.framing or (clip.get('recipe') or {}).get('framing') or 'auto')
 
-    try:
-        segments = recut.normalize_segments(
-            [{"start": s.start, "end": s.end} for s in req.segments],
-            source_duration)
-        if req.snap_to_words:
-            snap_bound = source_duration or max(s['end'] for s in segments)
-            segments = recut.snap_segments(segments, transcript, snap_bound)
-            if not source_path:
-                # Snapping trails into silence and may nudge a boundary past
-                # the canonical range; without a source the fast path is the
-                # only path, so clamp back instead of failing with a 409.
-                segments = [
-                    {"start": round(max(s['start'], canonical_range['start']), 3),
-                     "end": round(min(s['end'], canonical_range['end']), 3)}
-                    for s in segments]
-            # Re-validate after snapping/clamping: a segment fully outside the
-            # canonical range clamps to an inverted (end < start) window, and
-            # snapping can stretch the total past the cap. Without this it
-            # reaches ffmpeg and dies as a 500 instead of a clean 400.
-            segments = recut.normalize_segments(segments, source_duration)
-    except recut.RecutError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    segments = _edl_segments(
+        req.segments, transcript, source_duration, req.snap_to_words,
+        # Snapping trails into silence and may nudge a boundary past the
+        # canonical range; without a source the fast path is the only path,
+        # so clamp back instead of failing with a 409.
+        clamp_range=None if source_path else canonical_range)
 
     # A framing override always re-reframes from the source: the canonical file
     # has the old layout baked into its pixels.
@@ -5036,16 +5601,8 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
                 output_dir=output_dir, clean_name=clean_name,
                 reframe=False, captions_transcript=v_transcript,
                 captioner=_recut_captioner(clip))
-        return recut.perform_recut(
-            input_path=source_path, segments=segments,
-            output_dir=output_dir, clean_name=clean_name,
-            reframe=True, output_format=data.get('output_format', 'auto'),
-            force_strategy=force_strategy,
-            captions_transcript=v_transcript,
-            captioner=_recut_captioner(clip),
-            # Trim the source's own subtitles only when ours go back on.
-            subtitle_band=(data.get('source_subtitle_band')
-                           if v_transcript else None))
+        return _source_recut(data, clip, source_path, segments, output_dir,
+                             clean_name, force_strategy, v_transcript)
 
     try:
         loop = asyncio.get_event_loop()
@@ -5104,6 +5661,218 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             await _metering.release_reservation(reservation_id)
         print(f"❌ Rerender Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Agent as editor: whole-source transcript + brand-new clips ---------------
+#
+# An outside agent (MCP) reads the job's transcript, picks its own moments by
+# meaning, and renders them as NEW clips appended to the job. Clip indices are
+# positional (deleted clips stay as tombstones), so a new clip only ever goes
+# on the end, and the per-job count is capped so the list cannot grow forever.
+
+MAX_CLIPS_PER_JOB = 40
+_CLIP_TITLE_MAX = 120
+
+
+def _round2(value):
+    return round(float(value), 2)
+
+
+@app.get("/api/jobs/{job_id}/transcript")
+async def get_job_transcript(job_id: str, request: Request, words: bool = False,
+                             start: Optional[float] = None,
+                             end: Optional[float] = None):
+    """The whole-source transcript (source seconds), or the slice that
+    overlaps [start, end]. ``words=true`` adds word timings for that range."""
+    await _ensure_job_files(job_id, request)
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[job_id])
+
+    if (start is not None and start != start) or (end is not None and end != end):
+        raise HTTPException(status_code=400, detail="start/end must be numbers")
+    if start is not None and end is not None and end <= start:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    transcript = data.get('transcript') or {}
+
+    lo = float(start) if start is not None else float('-inf')
+    hi = float(end) if end is not None else float('inf')
+
+    segments_out = []
+    for i, seg in enumerate(transcript.get('segments') or []):
+        try:
+            s, e = float(seg['start']), float(seg['end'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e > lo and s < hi:
+            segments_out.append({"i": i, "start": _round2(s), "end": _round2(e),
+                                 "text": str(seg.get('text') or '').strip()})
+
+    source_path = _locate_source(job_id)
+    duration = _source_duration_seconds(source_path) if source_path else None
+    out = {
+        "job_id": job_id,
+        "language": transcript.get('language') or 'none',
+        "duration": _round2(duration) if duration is not None else None,
+        "segments": segments_out,
+    }
+    if words:
+        out["words"] = [
+            {"w": w["w"], "s": _round2(w["s"]), "e": _round2(w["e"])}
+            for w in recut.transcript_words(transcript)
+            if w["e"] > lo and w["s"] < hi]
+    if not (transcript.get('segments') or []):
+        out["note"] = ("No speech was transcribed for this video (silent or "
+                       "music-only source). Choose clip boundaries from the "
+                       "existing clips' source segments instead.")
+    return out
+
+
+class CreateClipRequest(BaseModel):
+    job_id: str
+    segments: List[RerenderSegment]
+    # Bounded here only to cap the payload; the stored title is cut to 120.
+    title: Optional[str] = None
+    snap_to_words: bool = True
+    reapply_captions: bool = True
+    framing: Optional[str] = None
+
+
+def _clean_clip_title(raw, fallback):
+    """Strip control/format characters, collapse whitespace, cap the length."""
+    import unicodedata
+    if not isinstance(raw, str):
+        return fallback
+    text = "".join(" " if unicodedata.category(ch).startswith("C") else ch
+                   for ch in raw[:2000])
+    text = " ".join(text.split())[:_CLIP_TITLE_MAX].strip()
+    return text or fallback
+
+
+@app.post("/api/clip/create")
+async def create_clip(req: CreateClipRequest, request: Request):
+    """Render a brand-new clip from source segments the caller chose, and
+    append it to the job. Always the SOURCE path (cut from the retained
+    source, re-reframed): there is no canonical file to cut from yet."""
+    await require_managed_entitlement(request)
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    # Same per-job lock as rerender: both read-modify-write metadata.json, and
+    # two concurrent creates must not claim the same index.
+    lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
+    async with lock:
+        return await _create_clip_locked(req, request, job)
+
+
+async def _create_clip_locked(req: CreateClipRequest, request: Request, job):
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+
+    clips = data.get('shorts') or []
+    # Tombstones count: they still hold an index (and files on disk).
+    if len(clips) >= MAX_CLIPS_PER_JOB:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This job already has {MAX_CLIPS_PER_JOB} clips, the maximum.")
+
+    framing, force_strategy = _resolve_framing(req.framing or 'auto')
+
+    source_path = _locate_source(req.job_id)
+    if not source_path:
+        raise HTTPException(
+            status_code=409,
+            detail="The source video is no longer on the server, so new clips "
+                   "cannot be cut from it.")
+    source_duration = _source_duration_seconds(source_path)
+    transcript = data.get('transcript') or {}
+
+    segments = _edl_segments(req.segments, transcript, source_duration,
+                             req.snap_to_words)
+
+    index = len(clips)
+    base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+    clean_name = f"{base_name}_clip_{index + 1}.mp4"
+    title = _clean_clip_title(req.title, f"Clip {index + 1}")
+
+    total = recut.total_duration(segments)
+    minutes = _cloud_config.EDITOR_ACTION_MINUTES if BILLING_ENABLED else 0
+    reservation_id = await reserve_managed_action(
+        request, minutes, req.job_id, "create_clip")
+
+    v_transcript = (recut.virtual_transcript(transcript, segments)
+                    if req.reapply_captions else None)
+
+    def run_recut():
+        return _source_recut(data, {}, source_path, segments, output_dir,
+                             clean_name, force_strategy, v_transcript)
+
+    try:
+        loop = asyncio.get_event_loop()
+        served_name, clean_recut_name = await loop.run_in_executor(None, run_recut)
+        served_name = await _deliver(request, req.job_id, served_name)
+
+        video_url = f"/videos/{req.job_id}/{served_name}"
+        new_start = min(s['start'] for s in segments)
+        new_end = max(s['end'] for s in segments)
+        recipe = {"v": 1, "segments": segments,
+                  "canonical_range": {"start": new_start, "end": new_end}}
+        if framing != 'auto':
+            recipe["framing"] = framing
+        entry = {
+            "start": new_start,
+            "end": new_end,
+            "video_url": video_url,
+            "recipe": recipe,
+            "layout_ranges": layout_ranges.read(
+                os.path.join(output_dir, clean_recut_name)),
+            "title": title,
+            "video_title_for_youtube_short": title,
+            "created_by": "agent",
+        }
+        clips.append(entry)
+        data['shorts'] = clips
+        write_json_atomic(json_files[0], data, indent=2)
+        result = job.get('result')
+        if not isinstance(result, dict):
+            result = job['result'] = {}
+        mem_clips = result.setdefault('clips', [])
+        if len(mem_clips) == index:
+            mem_clips.append(dict(entry))
+
+        _archive_clip_edit_bg(req.job_id, index, served_name)
+        if reservation_id:
+            await _metering.commit_reservation(reservation_id)
+        return {
+            "success": True,
+            "clip_index": index,
+            "new_video_url": video_url,
+            "title": title,
+            "recipe": recipe,
+            "framing": framing,
+            "start": new_start,
+            "end": new_end,
+            "duration": total,
+        }
+    except Exception as e:
+        if reservation_id:
+            await _metering.release_reservation(reservation_id)
+        print(f"❌ Create clip error: {e}")
+        raise HTTPException(status_code=500, detail="Rendering the new clip failed.")
 
 
 # --- Manual framing -----------------------------------------------------------

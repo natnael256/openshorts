@@ -42,7 +42,7 @@ from .models import (
     User, Subscription, CreditTopup, UsageLedger, MagicLinkToken,
     SignupAttribution, ApiKey, UploadPostProfile, UserVideo, ClipExpiryWarning,
     Project, AccountDeletion, OAuthCode, OAuthRefreshToken, AutopilotRun, AutopilotSettings,
-    LifecycleEmail, CancellationFeedback, OnboardingSurvey, LoginCode,
+    LifecycleEmail, CancellationFeedback, OnboardingSurvey, LoginCode, BriefPreset,
 )
 
 # Every table that holds rows belonging to a user, child-first (clip_expiry_
@@ -58,7 +58,7 @@ USER_OWNED_TABLES = (
     ClipExpiryWarning, UserVideo, Project, UsageLedger, CreditTopup,
     Subscription, OAuthRefreshToken, ApiKey, SignupAttribution, UploadPostProfile, OAuthCode,
     AutopilotRun, AutopilotSettings, LifecycleEmail, CancellationFeedback,
-    OnboardingSurvey, LoginCode,
+    OnboardingSurvey, LoginCode, BriefPreset,
 )
 
 # The optional "why are you leaving" answer, as a closed list. It was a free

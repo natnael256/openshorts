@@ -47,6 +47,8 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - Quota wall, free overflow, lifecycle emails, cancel flow, survey, GDPR erasure → `docs/architecture/billing-and-account.md`
 - Concurrency/VRAM, auto-retry, deploy handover and drain → `docs/architecture/jobs-and-deploys.md`
 - Download routing, yt-dlp clients, paid proxy ledger → `docs/architecture/proxy-routing.md`
+- Creator brief (per-video instructions, presets, post-check), clip history → `docs/architecture/creator-brief.md`
+- Automatic hooks (hook pass, hook score, teaser cold open) → `docs/architecture/auto-hooks.md`
 
 ## Hard rules
 
@@ -71,6 +73,23 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 **Clip selection**
 - The scoring pass ranks every window (global top N), never "choose up to K per batch". The `min_clips` floor is enforced in code.
 - `get_visual_clips` is the only stage that sends Gemini the video; past `VISION_SEGMENT_SECONDS` it watches near-equal stretches (`vision_segments`), never one upload of the whole source.
+
+**Creator brief**
+- The brief is untrusted text: it travels only in the job's `.brief.json` sidecar (never env, argv, the resume manifest or a log line) and reaches a model only through `creator_brief.prompt_block` / `check_clip` (sanitised, nonce-delimited, appended after `format`).
+- Everything the brief changes in a render is a closed choice re-validated in code (`creator_brief.validate_directives`); explicit `clip_min_seconds` / `clip_max_seconds` on the request win over it.
+- The score block only moves scores (every window still gets an entry); the post-check annotates `brief_check` and never deletes or fails a clip.
+- `/api/clip-history` passes through the job result's own `video_url` (never builds one from file names) and lists only the caller's jobs in cloud mode.
+
+**Automatic hooks and history**
+- The hook pass (`auto_hooks.run_pass`) runs after the `min_clips` floor and never adds or removes clips; it only re-scores (`predicted_score` blend), trims a lead-in to a beat boundary and picks from closed choices that `auto_hooks.validate` re-checks in code. A hook text with a number the clip does not say is rejected.
+- The teaser cold open is an automatic recut (`teaser.py` → `recut.perform_recut`, `clip['recipe']` with `teaser: true`): never a second concat engine, never a change to the canonical clip. Any failure falls back to the clip as cut.
+- Self-host keeps completed clip jobs until the user deletes them (`KEEP_HISTORY`, `app._is_kept_job`): the age sweep and the `OUTPUT_MAX_GB` trim skip them, and the cap only reports (`/api/storage`). Cloud retention is unchanged.
+- A deleted clip is a tombstone (`deleted: true`, no `video_url`), never a removed list entry: clip indices are positional. Every reader that rebuilds `video_url` from disk skips tombstones.
+
+**Manual retry**
+- `POST /api/jobs/{id}/retry` re-runs a failed or lost job under the same id from its `.submit.json` (`job_retry.py`): the stored argv must pass `job_retry.cmd_is_safe`, settings come from the closed `SETTING_KEYS` allowlist, and no key, proxy URL or cookie is ever written there. The brief is never re-posted: it stays in `.brief.json`.
+- A retry reserves minutes again through `reserve_process_minutes` (the failed run's reservation was released) and is capped by `MANUAL_RETRY_LIMIT` per job; a refusal leaves the job untouched.
+- Never run `pytest` with the repo's `output/` shared with a live server: `tests/test_mcp_stdio.py` enters the app lifespan, which stamps `output/.instance`, and the live instance then drains and starts no jobs until it is restarted. Run the suite with a private `output/` and `uploads/`.
 
 **Jobs, GPU, deploys**
 - Call `transcribe_backends.release_models()` after any ASR (job processes and in-API transcriptions alike). Size `MAX_CONCURRENT_JOBS` by free VRAM first.

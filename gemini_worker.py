@@ -34,6 +34,16 @@ class ScoreResponse(BaseModel):
 class DetailClipModel(BaseModel):
     start: float
     end: float
+    # The clip as one idea: `about` says what it is about, `first_piece` is
+    # the piece of the window's numbered `pieces` where that idea starts being
+    # set up, `last_piece` the one where it lands; code turns them into
+    # seconds (clip_selection.apply_piece_picks). start/end stay as the
+    # fallback when a pick is missing or malformed, and -1 / "" (defaults, so
+    # a small local model that skips them does not fail validation) mean
+    # "no pick".
+    about: str = ""
+    first_piece: int = -1
+    last_piece: int = -1
     source_window_id: str
     predicted_score: int
     video_description_for_tiktok: str
@@ -299,22 +309,37 @@ Choose the BEST short clips from these shortlisted candidate windows.
 
 CLIP RULES:
 - Return only valid JSON.
+- Each window's transcript is a list of numbered `pieces`: [index, start_second, text],
+  short phrases of speech in order (a piece ends where the next one starts).
+  Punctuation and capitals come from speech-to-text and are often missing or wrong:
+  decide by MEANING, never by where a full stop happens to be.
+- A CLIP IS ONE COMPLETE IDEA. For each clip:
+  1. `about`: one sentence saying what the clip is about (who or what, and the point).
+  2. `first_piece`: the piece where that idea starts being SET UP: the question being
+     answered, the claim being made, or the piece that introduces the subject, so a
+     cold viewer knows who and what is being discussed from the first words.
+  3. `last_piece`: the piece where the idea LANDS: the answer, the punchline, the
+     conclusion. Not a thought left hanging, not trailing into the next topic.
+  Also give `start` = the start of first_piece and `end` = the start of the piece
+  after last_piece. (A window given as plain `text` instead: first_piece = last_piece = -1.)
+- STANDS ALONE: the first piece must make sense to someone who has heard nothing
+  before it. Never open on an answer whose question is in an earlier piece ("Hell no,
+  man."), on a he/she/they/it/this/that whose meaning is only earlier ("They can't
+  open a file"), or on the middle of a thought ("So things like..."): pick the earlier
+  piece where it begins. Fix context by moving the START earlier, never by cutting
+  the ending short: a clip that loses its payoff to gain context has traded down.
 - Each clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute seconds from the start of the source video.
+  If no self-contained idea of that length exists in a stretch, skip it rather than
+  return a clip that opens or ends mid-idea.
 - Stay within the candidate window boundaries.
-- THE 2-SECOND RULE: the clip MUST open on its strongest moment. If the first
-  2 seconds would not stop a cold viewer from scrolling, move the start or skip the clip.
-- Start slightly before the hook and end slightly after the payoff when possible.
+- THE 2-SECOND RULE: the setup must grab. Prefer ideas whose setup is itself a
+  hook (a sharp question, a bold claim, a surprising fact); skip an idea whose setup
+  would not stop a cold viewer from scrolling.
 - When a window has `viewer_moments` ([start, end] stretches the stream's
   viewers clipped), the best clip of that window should cover the strongest
-  of them, opening a few seconds before it so the moment has its setup.
-- Do not cut in the middle of a word or phrase.
+  of them, opening where that moment is set up.
 - No generic intros/outros unless they are the hook.
-- STANDS ALONE: the clip must make sense to someone who has seen nothing else.
-  If it opens on a pronoun, a "that", a "so anyway", or an answer whose question
-  was asked earlier, move the start back to where the idea begins or skip it.
-  A brilliant moment that needs the previous five minutes is not a clip.
-  Fix this by moving the START earlier, never by cutting the ending short: a
-  clip that loses its payoff to gain context has traded down.
+- A brilliant moment that needs the previous five minutes is not a clip.
 - HOW MANY: return {min_clips} to {max_clips} clips. Work through EVERY candidate
   window — they were already scored as the best moments in the video, so a window
   that yields nothing should be the exception, not the norm. Two or three clips
@@ -357,9 +382,85 @@ Return only:
 {{
   "shorts": [
     {{
+      "about": "<one sentence: what this clip is about>",
+      "first_piece": <piece index>,
+      "last_piece": <piece index>,
       "start": <number>,
       "end": <number>,
       "source_window_id": "<window id>",
+      "predicted_score": <integer 0-100>,
+      "video_description_for_tiktok": "<description + hashtags>",
+      "video_description_for_instagram": "<description + hashtags>",
+      "video_title_for_youtube_short": "<title max 100 chars>",
+      "viral_hook_text": "<short overlay max 10 words>",
+      "why": "<one sentence, max 20 words>"
+    }}
+  ]
+}}
+"""
+
+
+# Copy pass of the idea pipeline (main._clips_from_ideas): each candidate is
+# ONE idea whose edges the idea pass and the context check already decided,
+# so this pass only writes the copy (and may skip a candidate it would not
+# publish). Kept separate from DETAIL_PROMPT_TEMPLATE, which stays the window
+# fallback's prompt unchanged.
+IDEA_DETAIL_PROMPT_TEMPLATE = """
+You are a senior short-form video editor and viral copywriter.
+Each candidate below is ONE complete idea from a longer video, already cut so that it
+opens where its subject is introduced and ends where its point lands. Its transcript is
+a list of numbered `pieces` [index, start_second, text] (speech-to-text: punctuation and
+capitals are often missing or wrong). Write the copy for each candidate.
+
+RULES:
+- Return only valid JSON.
+- One entry per candidate, with `source_window_id` = the candidate's `id`. Do not change
+  its edges: set `start` and `end` to the candidate's own, first_piece = last_piece = -1.
+- Skip a candidate only when you would not publish it yourself (pure filler, housekeeping,
+  an outro, a moment that means nothing on its own). These candidates were already ranked
+  as the best ideas in the video, so skipping should be the exception. Aim for
+  {min_clips} to {max_clips} clips in total.
+- DIVERSITY: if two candidates make the same point, tell the same story or land the same
+  joke, keep the stronger one and skip the other.
+- When a candidate has `viewer_moments`, the stream's viewers clipped that stretch: weigh it up.
+
+HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 10 words):
+- Open question: "Why does everyone get this wrong?"
+- Hot take / controversy: "Stop doing this. Seriously."
+- Number / fact shock: "97% of people miss this."
+- Story loop: "This one email almost ruined me."
+- POV / pattern interrupt: "POV: you finally understand it."
+(These are English PATTERNS — always write the actual hook in TRANSCRIPT_LANGUAGE.)
+- ABOUT THIS MOMENT, NOT THE VIDEO: the hook and the title name the concrete
+  thing that happens inside this clip — the tool being set up, the action,
+  the number, the claim, the name. A line that could sit on any clip of this
+  video is wrong. If nothing concrete can be named, quote the clip's strongest
+  sentence instead of summarising the topic. Never invent a claim, name or number.
+
+COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TRANSCRIPT_LANGUAGE ({language}):
+- Descriptions (TikTok + Instagram): 1-2 punchy sentences that tease the payoff
+  without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
+- `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
+- `predicted_score`: honest 0-100 estimate of viral potential.
+- `why`: one sentence, max 20 words, naming what makes THIS moment worth a
+  clip — the specific hook, claim, number or payoff, not the topic.
+- `about`: one sentence saying what the clip is about.
+
+TRANSCRIPT_LANGUAGE: {language}
+VIDEO_DURATION_SECONDS: {video_duration}
+CANDIDATE_IDEAS_JSON:
+{ideas_json}
+
+Return only:
+{{
+  "shorts": [
+    {{
+      "source_window_id": "<candidate id>",
+      "start": <number>,
+      "end": <number>,
+      "about": "<one sentence>",
+      "first_piece": -1,
+      "last_piece": -1,
       "predicted_score": <integer 0-100>,
       "video_description_for_tiktok": "<description + hashtags>",
       "video_description_for_instagram": "<description + hashtags>",

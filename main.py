@@ -23,18 +23,24 @@ import mediapipe as mp
 from google import genai
 from google.genai import types as genai_types
 
+import auto_hooks
+import context_check
+import creator_brief
 import frame_sampler
 import gpu_decode
 import gemini_worker
 import hook_grounding
+import idea_segments
 import layout_picker
 import llm_backend
+import teaser
 import twitch_signals
-from clip_selection import (build_transcript_windows, clip_count_targets,
-                            clip_duration_bounds, dedupe_overlapping,
-                            score_batches, shortlist_target,
-                            snap_clip_to_words, trim_to_best,
-                            vision_segments)
+from clip_selection import (apply_piece_picks, boundary_label, boundary_model_name,
+                            build_pieces, build_transcript_windows, clip_count_targets,
+                            clip_duration_bounds, clip_length_overrun, dedupe_overlapping,
+                            pieces_payload, score_batches, shortlist_target,
+                            snap_clip_to_pieces, snap_clip_to_words,
+                            trim_to_best, vision_segments, window_pieces)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
 from dotenv import load_dotenv
@@ -1294,7 +1300,7 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None  # silent video: nothing to caption
     try:
         import subtitles as _subs
-        style = _subs.AUTO_CAPTION_STYLE
+        style = creator_brief.caption_style(_subs.AUTO_CAPTION_STYLE)  # brief's look, if any
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
         generation_id = int(time.time())
@@ -1399,6 +1405,14 @@ def auto_hook_clip(clip_path, clip, captions=None, mark=False):
         seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
     except ValueError:
         seconds = 5.0
+    # A clip with a cold open (teaser.py) shows the hook, larger, over the
+    # teaser; a brief's hook_seconds (AUTO_HOOK_SECONDS) still wins.
+    scale = {}
+    teased = teaser.teaser_seconds(clip)
+    if teased > 0:
+        if not os.environ.get("AUTO_HOOK_SECONDS", "").strip():
+            seconds = round(max(2.5, teased), 2)
+        scale = {"font_scale": 1.3}
     try:
         from hooks import add_hook_to_video, HOOK_STYLES
         if style not in HOOK_STYLES:
@@ -1410,8 +1424,10 @@ def auto_hook_clip(clip_path, clip, captions=None, mark=False):
         # the layout ranges say where the captions sit (the seam on SPLIT).
         config = {"text": text, "style": style, "position": "auto",
                   "duration_seconds": seconds}
+        if scale:
+            config["size"] = "L"   # the editor's size for font_scale 1.3
         place = {"position": "auto", "layout_ranges": clip.get('layout_ranges'),
-                 "has_captions": bool(captions)}
+                 "has_captions": bool(captions), **scale}
 
         def note(result):
             if isinstance(result, dict) and result.get("y") is not None:
@@ -1962,6 +1978,9 @@ def transcribe_video(video_path):
 
     return transcript
 
+_OVERLOADED_MODELS = set()
+
+
 def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
     Returns (parsed_dict, cost_analysis).
@@ -1976,6 +1995,31 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         response_mime_type="application/json",
         response_schema=schema,
     )
+    # Local change: when Google says the model is overloaded (503/429) on every
+    # retry, fall back to the next model instead of failing the whole job.
+    # (Not the retired gemini-2.5 models: a fallback that 404s ends the job.)
+    fallbacks = [m.strip() for m in os.environ.get(
+        "GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-3-flash-preview").split(",")
+        if m.strip() and m.strip() != model_name]
+    models = [model_name] + ([] if use_local else fallbacks)
+    # Skip models already found overloaded earlier in this job (each window is
+    # a separate call; don't spend 15 s of retries on a dead model every time).
+    models = [m for m in models if m not in _OVERLOADED_MODELS] or models[-1:]
+    for idx, current in enumerate(models):
+        try:
+            return _run_gemini_stage_once(client, current, prompt, config, use_local, schema)
+        except gemini_worker.GeminiBlockedError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            overloaded = any(t in msg for t in ('503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED', 'overloaded'))
+            if not overloaded or idx == len(models) - 1:
+                raise
+            _OVERLOADED_MODELS.add(current)
+            print(f"🔁 {current} is overloaded — switching to {models[idx + 1]}")
+
+
+def _run_gemini_stage_once(client, model_name, prompt, config, use_local, schema=None):
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
@@ -2058,26 +2102,351 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
-    """Two-pass clip selection: score transcript windows, then detail the best.
+def _stage_runner(client, model_name, costs, timeout_ms=60000):
+    """``run(prompt, schema) -> dict`` for a pass of get_viral_clips that
+    must count toward the job's cost total (``costs``): the idea pass and
+    the context check (on the boundary model). On Gemini it uses its own
+    client with a timeout, so a hung call cannot stall the job; the
+    retry/backoff policy is _run_gemini_stage's."""
+    if not llm_backend.active():
+        try:
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"),
+                                  http_options=genai_types.HttpOptions(timeout=timeout_ms))
+        except Exception:
+            pass   # keep the detail pass's client
 
-    Windowing gives even coverage on long videos (a single call over the whole
-    transcript clusters picks near the start), and the cheap scoring pass keeps
-    the expensive detail reasoning focused on the shortlist. Cuts are snapped to
-    word boundaries so clips don't start/end mid-word.
+    def run(prompt, schema):
+        parsed, cost = _run_gemini_stage(client, model_name, prompt, schema)
+        if cost:
+            costs.append(cost)
+        return parsed
+    return run
+
+
+def _brief_runner():
+    """``run(prompt, schema) -> dict`` for creator_brief, through
+    _run_gemini_stage (Gemini or the local LLM); None without either."""
+    if llm_backend.active():
+        client, model_name = None, llm_backend.model_name()
+    else:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        # A hung call must not stall the job (ms).
+        client = genai.Client(api_key=api_key,
+                              http_options=genai_types.HttpOptions(timeout=60000))
+        model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+    return lambda prompt, schema: _run_gemini_stage(client, model_name, prompt, schema)[0]
+
+
+def _activate_creator_brief(output_dir):
+    """Load the job's creator brief (creator_brief.SIDECAR), compile its closed
+    directives into the env and activate it for prompts/render. Must run before
+    clip_duration_bounds() is first read. Never logs the brief text."""
+    if creator_brief.active_brief():
+        return
+    try:
+        brief = creator_brief.load(output_dir)
+        if not brief:
+            return
+        run = _brief_runner()
+        directives = creator_brief.compile_directives(brief, run)
+        notes = creator_brief.apply_to_env(directives, os.environ)
+        creator_brief.write_applied(output_dir, directives)  # History: what changed
+        creator_brief.activate(brief, directives)
+        print(f"📝 Creator brief: {len(brief)} chars"
+              + ("" if run else " (no model configured: prompts only)")
+              + (f" — {'; '.join(notes)}" if notes else ""))
+    except Exception as e:
+        print(f"⚠️ Creator brief skipped ({type(e).__name__}).")
+
+
+def _cost_summary(costs, model_name, boundary_model=None):
+    """The job's cost total over every counted call; with a separate
+    boundary model, its name and its share (``boundary_cost``)."""
+    costs = [c for c in costs or [] if c]
+    if not costs:
+        return None
+    out = {
+        "input_tokens": sum(c.get("input_tokens", 0) for c in costs),
+        "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
+        "total_cost": sum(c.get("total_cost", 0) for c in costs),
+        "model": model_name,
+        "calls": len(costs),
+    }
+    if boundary_model and boundary_model != model_name:
+        out["boundary_model"] = boundary_model
+        out["boundary_cost"] = sum(c.get("total_cost", 0) for c in costs
+                                   if c.get("model") == boundary_model)
+    return out
+
+
+def _clips_from_ideas(ideas, pieces, *, client, model_name, costs, boundary_run,
+                      video_duration, language, min_secs, max_secs, overrun, target,
+                      viewer_clips=None):
+    """Clips chosen among ideas (idea_segments.py): ``(shorts, max_clips)``,
+    or None when there are fewer ideas than the clip floor (the caller then
+    uses the window pipeline).
+
+    1. Rank: every idea was scored; the candidates are the GLOBAL top
+       ``max_clips + spare`` (``idea_segments.top_ideas``), never a quota per
+       chunk.
+    2. Check before copy: the context check (boundary model) tests each
+       candidate's opening and ending and repairs what it can, so the copy
+       below is written for the final cut and selection can prefer a
+       self-contained idea (``idea_segments.rerank``): a candidate whose
+       opening stays unresolved drops behind one of similar score that is
+       clean, and the shortlist is the top ``max_clips`` of that order.
+    3. Copy: the detail pass writes titles / hooks / descriptions for the
+       shortlist (job model); the floor: when it returns fewer than
+       ``min_clips``, the shortlisted ideas it skipped and the spare
+       candidates get one more call for the difference (an empty answer is
+       accepted: padding is worse than a short list).
+    4. ``idea_segments.attach`` gives each clip its idea's edges and record.
+    """
+    min_clips, max_clips = clip_count_targets(target)
+    if len(ideas) < min_clips:
+        print(f"   Only {len(ideas)} idea(s) for a floor of {min_clips} clip(s): "
+              f"using scoring windows instead.")
+        return None
+    local = llm_backend.active()
+    spare_n = max(2, min_clips // 2)
+    candidates = idea_segments.top_ideas(ideas, max_clips + spare_n)
+    print("   " + context_check.run_pass(
+        candidates, pieces, boundary_run, batch=2 if local else None,
+        min_secs=min_secs, max_secs=max_secs, overrun=overrun))
+    ranked = idea_segments.rerank(candidates)
+    shortlist, spare = ranked[:max_clips], ranked[max_clips:]
+
+    heat = twitch_signals.window_heat(ideas, viewer_clips) if viewer_clips else {}
+    if heat:
+        before = {d["id"] for d in shortlist}
+        seen = {d["id"] for d in ranked}
+        order = ranked + [d for d in sorted(ideas, key=lambda d: (-d["score"], d["start"]))
+                          if d["id"] not in seen]
+        shortlist = twitch_signals.promote_hot_windows(shortlist, order, heat, max_clips)
+        added = [d["id"] for d in shortlist if d["id"] not in before]
+        if added:
+            print(f"   👀 Promoted {len(added)} idea(s) viewers clipped: {added}")
+        kept_ids = {d["id"] for d in shortlist}
+        spare = [d for d in ranked if d["id"] not in kept_ids]
+    flagged = sum(1 for d in shortlist if idea_segments.rank_score(d) < d["score"])
+    print(f"   Shortlisted {len(shortlist)} idea(s) for copy"
+          + (f" ({flagged} not fully self-contained)" if flagged else "")
+          + f", {len(spare)} spare.")
+
+    def _detail(items, lo, hi, label):
+        # Gemini: one call. A local LLM: 4 ideas per call (its 4-8k context).
+        # Batching is safe here: the prompt writes copy for every candidate
+        # it is given (skipping only what it would not publish), it does not
+        # pick "up to K" per batch.
+        size = 4 if local else max(1, len(items))
+        out = []
+
+        def build(ds):
+            return gemini_worker.IDEA_DETAIL_PROMPT_TEMPLATE.format(
+                video_duration=video_duration, language=language,
+                min_clips=lo, max_clips=hi,
+                ideas_json=json.dumps(idea_segments.detail_payload(ds, pieces, heat),
+                                      ensure_ascii=False)
+            ) + creator_brief.prompt_block(creator_brief.active_brief(), "detail")
+        for k in range(0, len(items), size):
+            out.extend(_run_stage_split(client, model_name, items[k:k + size], build,
+                                        gemini_worker.DetailResponse, "shorts", costs, label))
+        return out
+
+    shorts = _detail(shortlist, min_clips, max_clips, "detail")
+    # The floor is enforced in code, not just in the prompt (as on the window
+    # path): the ideas the copy pass skipped and the spare candidates are the
+    # cheap second chance, already ranked and checked.
+    if len(shorts) < min_clips:
+        used = {str(s.get("source_window_id") or "") for s in shorts}
+        rest = [d for d in shortlist if d["id"] not in used] + spare
+        if rest:
+            missing = min_clips - len(shorts)
+            print(f"   Copy returned {len(shorts)} clip(s) of {min_clips}; asking "
+                  f"{len(rest)} unused idea(s) for {missing} more.")
+            extra = _detail(rest, missing, max(missing, len(rest)), "detail-floor")
+            if extra:
+                shorts = shorts + extra
+                print(f"   Recovered {len(extra)} clip(s) from them.")
+    attached = idea_segments.attach(shorts, ideas, pieces)
+    shorts.sort(key=lambda s: float(s.get("start") or 0))
+    if shorts:
+        print(f"   Boundaries: {attached} clip(s) on their idea's edges, "
+              f"{len(shorts) - attached} by seconds.")
+    return shorts, max_clips
+
+
+def _clips_from_windows(transcript_result, video_duration, pieces, *, client, model_name,
+                        costs, language, min_secs, max_secs, target, viewer_clips=None):
+    """The window pipeline (the fallback when the idea pass yields too few
+    ideas): score ~90 s windows, shortlist the global top ``target``, the
+    detail pass picks each clip inside them by piece, the floor top-up.
+    Returns ``(shorts, max_clips)``."""
+    # Scoring windows must be able to CONTAIN a max-length clip (the detail
+    # prompt keeps clips inside their candidate window), so scale them with
+    # the requested band — a user asking for 60-90s clips on the default
+    # 90s windows would get clips squeezed against the window walls.
+    windows = build_transcript_windows(
+        transcript_result, video_duration,
+        window_seconds=max(90, int(max_secs * 1.5)))
+    print(f"   Built {len(windows)} scoring window(s).")
+
+    # --- Pass 1: score windows in batches, keep the highest-scoring ---
+    scored = []
+    # Local models usually run with a 4-8k context (Ollama defaults to
+    # 4096 unless OLLAMA_CONTEXT_LENGTH says otherwise) and 8 windows of
+    # transcript do not fit; a silently truncated prompt scores garbage.
+    SCORE_BATCH = score_batch_size()
+    # The batches only split the work: the prompt scores every window it
+    # is given and the shortlist below is the global top `target`. Letting
+    # each batch SELECT instead (the old "up to 3 per batch") capped the
+    # shortlist at 3 * n_batches, under the target for any source shorter
+    # than ~30 min. See clip_selection.score_batches.
+    heat = twitch_signals.window_heat(windows, viewer_clips) if viewer_clips else {}
+    if heat:
+        print(f"   👀 Viewer clips fall in {len(heat)} window(s).")
+
+    def _payload(ws, with_pieces=False):
+        out = []
+        for w in ws:
+            item = {"id": w["id"], "start": w["start"], "end": w["end"]}
+            # Detail pass: numbered pieces instead of one block of text,
+            # so each clip's idea is picked by piece, not by a time guess.
+            wp = window_pieces(pieces, w["start"], w["end"]) if with_pieces else []
+            if wp:
+                item["pieces"] = pieces_payload(wp)
+            else:
+                item["text"] = w["text"]
+            h = heat.get(w["id"])
+            if h:
+                item["viewers_clipped"] = h["clips"]
+                item["viewer_clip_views"] = h["views"]
+                item["viewer_moments"] = h["spans"][:5]
+            out.append(item)
+        return out
+
+    def _score_prompt(ws):
+        return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+            video_duration=video_duration, language=language,
+            windows_json=json.dumps(_payload(ws), ensure_ascii=False)
+        ) + creator_brief.prompt_block(creator_brief.active_brief(), "score")
+
+    for batch in score_batches(windows, SCORE_BATCH):
+        scored.extend(_run_stage_split(
+            client, model_name, batch, _score_prompt,
+            gemini_worker.ScoreResponse, "windows", costs, "score"))
+
+    # Shortlist the top windows; scale with duration so long videos surface
+    # more candidates without exploding the detail call.
+    scored.sort(key=lambda w: w.get("score", 0), reverse=True)
+    by_id = {w["id"]: w for w in windows}
+    shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
+    if not shortlist:
+        shortlist = windows[:target]  # scoring returned nothing usable
+    if heat:
+        before = {w["id"] for w in shortlist}
+        ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
+        shortlist = twitch_signals.promote_hot_windows(shortlist, ranked, heat, target)
+        added = [w["id"] for w in shortlist if w["id"] not in before]
+        if added:
+            print(f"   👀 Promoted {len(added)} window(s) viewers clipped: {added}")
+    print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
+
+    # --- Pass 2: detailed clip extraction on the shortlist ---
+    min_clips, max_clips = clip_count_targets(len(shortlist))
+
+    def _detail_prompt_for(lo, hi):
+        # A split batch keeps the full clip-count band: a short list can
+        # still hold the best clips, and the model returns fewer anyway.
+        def build(ws):
+            return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                video_duration=video_duration, language=language,
+                min_clips=lo, max_clips=hi,
+                min_secs=min_secs, max_secs=max_secs,
+                windows_json=json.dumps(_payload(ws, with_pieces=True),
+                                        ensure_ascii=False)
+            ) + creator_brief.prompt_block(creator_brief.active_brief(), "detail")
+        return build
+
+    shorts = _run_stage_split(client, model_name, shortlist,
+                              _detail_prompt_for(min_clips, max_clips),
+                              gemini_worker.DetailResponse, "shorts", costs, "detail")
+
+    # The floor lived only in the prompt, and a prompt is not a contract:
+    # the model regularly returned half of it and the job shipped that.
+    # The windows it passed over are the cheap second chance — they are
+    # already the best-scoring ones in the video — so they get one more
+    # call for the missing clips. It may still come back empty, which is
+    # the honest answer for material that does not hold more.
+    if len(shorts) < min_clips:
+        used = {str(s.get("source_window_id") or "") for s in shorts}
+        spare = [w for w in shortlist if w["id"] not in used]
+        if spare:
+            missing = min_clips - len(shorts)
+            print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
+                  f"asking the {len(spare)} unused window(s) for {missing} more.")
+            extra = _run_stage_split(
+                client, model_name, spare,
+                _detail_prompt_for(missing, max(missing, len(spare))),
+                gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
+            if extra:
+                shorts = sorted(shorts + extra,
+                                key=lambda s: float(s.get("start") or 0))
+                print(f"   Recovered {len(extra)} clip(s) from them.")
+
+    # The model named each clip's idea by its first/last piece: turn that
+    # into seconds here, before the hook pass reads start/end. A missing
+    # or malformed pick keeps the model's own seconds (never drops a clip).
+    shown = {p["index"] for w in shortlist
+             for p in window_pieces(pieces, w["start"], w["end"])}
+    by_piece, by_seconds = apply_piece_picks(shorts, pieces, shown, min_secs, max_secs)
+    if shorts:
+        print(f"   Boundaries: {by_piece} clip(s) picked by piece, "
+              f"{by_seconds} by seconds.")
+    return shorts, max_clips
+
+
+def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
+    """Clip selection by IDEAS: segment the speech into scored ideas, check
+    the best ones' openings and endings, write copy for the shortlist.
+
+    The idea pass (idea_segments.py) reads the whole transcript in order, in
+    overlapping chunks, so no fixed window wall can separate a clip from its
+    setup; every idea is scored and the shortlist is the global top N. The
+    context check then names every reference a cold viewer cannot resolve in
+    each candidate's opening and moves the start to where it is introduced,
+    and makes the ending finish its thought, before the copy pass writes
+    titles and hooks for the final cut. The hook pass, the final snap in the
+    silence at the chosen edges and the de-duplication follow
+    (docs/architecture/clip-selection.md).
+
+    Too few ideas (the pass is off, failed, or the model could not follow
+    it) falls back to the window pipeline: ~90 s windows scored in batches,
+    the detail pass picks each clip inside the best ones, then the context
+    check after the hook pass.
+
+    ``GEMINI_BOUNDARY_MODEL`` runs the boundary stages (idea pass, context
+    check) on another allowed Gemini model; unset, they use GEMINI_MODEL.
 
     ``viewer_clips`` (``twitch_signals.viewer_clips_for_job``): stretches the
-    stream's own viewers clipped. They are shown to both passes on the windows
-    that hold them, and the hottest windows are guaranteed a shortlist slot.
+    stream's own viewers clipped. They are shown to the idea pass and the
+    copy pass (windows: both passes), and the hottest ideas (windows) are
+    guaranteed a shortlist slot.
     """
     language = str(transcript_result.get('language') or 'unknown')
     if llm_backend.active():
         # Self-hosted text model: no Google key needed for this stage.
         client = None
         model_name = llm_backend.model_name()
-        print(f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} (2-pass: score → detail)...")
+        boundary_model = model_name
+        print(f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} "
+              f"(ideas → check → copy)...")
+        if (os.environ.get("GEMINI_BOUNDARY_MODEL") or "").strip():
+            print("   ℹ️ GEMINI_BOUNDARY_MODEL does not apply to a local LLM.")
     else:
-        print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
+        print("\U0001f916  Analyzing with Gemini (ideas → check → copy)...")
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             print("❌ Error: GEMINI_API_KEY not found in environment variables "
@@ -2085,119 +2454,67 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             return None
         client = genai.Client(api_key=api_key)
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
-    print(f"\U0001f916  Model: {model_name} | language: {language}")
+        boundary_model, note = boundary_model_name(model_name)
+        if note:
+            print("   ⚠️ " + note)
+    print(f"\U0001f916  Model: {model_name}"
+          + (f" | boundaries: {boundary_model}" if boundary_model != model_name else "")
+          + f" | language: {language}")
 
     # Full word list — ground truth for snapping cut points.
     words = []
     for segment in transcript_result['segments']:
         for word in segment.get('words', []):
             words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
+    # Phrase-level pieces (clip_selection.build_pieces): ideas and checks name
+    # each clip's edges by piece, and the final snap only places the cut in
+    # the silence at the chosen pieces' edges.
+    pieces = build_pieces(words)
 
     try:
-        # Scoring windows must be able to CONTAIN a max-length clip (the detail
-        # prompt keeps clips inside their candidate window), so scale them with
-        # the requested band — a user asking for 60-90s clips on the default
-        # 90s windows would get clips squeezed against the window walls.
         min_secs, max_secs = clip_duration_bounds()
-        windows = build_transcript_windows(
-            transcript_result, video_duration,
-            window_seconds=max(90, int(max_secs * 1.5)))
-        print(f"   Built {len(windows)} scoring window(s).")
+        # Seconds a clip may run past the DEFAULT max to finish its idea
+        # (0 when the user set a max): used by the check, then by the snap.
+        overrun = clip_length_overrun()
         costs = []
-
-        # --- Pass 1: score windows in batches, keep the highest-scoring ---
-        scored = []
-        # Local models usually run with a 4-8k context (Ollama defaults to
-        # 4096 unless OLLAMA_CONTEXT_LENGTH says otherwise) and 8 windows of
-        # transcript do not fit; a silently truncated prompt scores garbage.
-        SCORE_BATCH = score_batch_size()
-        # The batches only split the work: the prompt scores every window it
-        # is given and the shortlist below is the global top `target`. Letting
-        # each batch SELECT instead (the old "up to 3 per batch") capped the
-        # shortlist at 3 * n_batches, under the target for any source shorter
-        # than ~30 min. See clip_selection.score_batches.
         target = shortlist_target(video_duration)
-        heat = twitch_signals.window_heat(windows, viewer_clips) if viewer_clips else {}
-        if heat:
-            print(f"   👀 Viewer clips fall in {len(heat)} window(s).")
-
-        def _payload(ws):
-            out = []
-            for w in ws:
-                item = {"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]}
-                h = heat.get(w["id"])
-                if h:
-                    item["viewers_clipped"] = h["clips"]
-                    item["viewer_clip_views"] = h["views"]
-                    item["viewer_moments"] = h["spans"][:5]
-                out.append(item)
-            return out
-
-        def _score_prompt(ws):
-            return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+        # The boundary stages (idea pass, context check) run on the boundary
+        # model, count toward the job's cost, and time out after 120 s.
+        boundary_run = _stage_runner(client, boundary_model, costs, timeout_ms=120000)
+        shorts, path, max_clips = None, "windows", None
+        if pieces and idea_segments.enabled():
+            ideas, note = idea_segments.run_pass(
+                pieces, boundary_run, local=llm_backend.active(),
+                min_secs=min_secs, max_secs=max_secs, overrun=overrun,
                 video_duration=video_duration, language=language,
-                windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+                viewer_clips=viewer_clips, brief=creator_brief.active_brief())
+            print("   " + note)
+            picked = _clips_from_ideas(
+                ideas, pieces, client=client, model_name=model_name, costs=costs,
+                boundary_run=boundary_run, video_duration=video_duration,
+                language=language, min_secs=min_secs, max_secs=max_secs,
+                overrun=overrun, target=target, viewer_clips=viewer_clips) if ideas else None
+            if picked is not None:
+                (shorts, max_clips), path = picked, "ideas"
+        if shorts is None:
+            shorts, max_clips = _clips_from_windows(
+                transcript_result, video_duration, pieces, client=client,
+                model_name=model_name, costs=costs, language=language,
+                min_secs=min_secs, max_secs=max_secs, target=target,
+                viewer_clips=viewer_clips)
 
-        for batch in score_batches(windows, SCORE_BATCH):
-            scored.extend(_run_stage_split(
-                client, model_name, batch, _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
-
-        # Shortlist the top windows; scale with duration so long videos surface
-        # more candidates without exploding the detail call.
-        scored.sort(key=lambda w: w.get("score", 0), reverse=True)
-        by_id = {w["id"]: w for w in windows}
-        shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
-        if not shortlist:
-            shortlist = windows[:target]  # scoring returned nothing usable
-        if heat:
-            before = {w["id"] for w in shortlist}
-            ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
-            shortlist = twitch_signals.promote_hot_windows(shortlist, ranked, heat, target)
-            added = [w["id"] for w in shortlist if w["id"] not in before]
-            if added:
-                print(f"   👀 Promoted {len(added)} window(s) viewers clipped: {added}")
-        print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
-
-        # --- Pass 2: detailed clip extraction on the shortlist ---
-        min_clips, max_clips = clip_count_targets(len(shortlist))
-
-        def _detail_prompt_for(lo, hi):
-            # A split batch keeps the full clip-count band: a short list can
-            # still hold the best clips, and the model returns fewer anyway.
-            def build(ws):
-                return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
-                    video_duration=video_duration, language=language,
-                    min_clips=lo, max_clips=hi,
-                    min_secs=min_secs, max_secs=max_secs,
-                    windows_json=json.dumps(_payload(ws), ensure_ascii=False))
-            return build
-
-        shorts = _run_stage_split(client, model_name, shortlist,
-                                  _detail_prompt_for(min_clips, max_clips),
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
-
-        # The floor lived only in the prompt, and a prompt is not a contract:
-        # the model regularly returned half of it and the job shipped that.
-        # The windows it passed over are the cheap second chance — they are
-        # already the best-scoring ones in the video — so they get one more
-        # call for the missing clips. It may still come back empty, which is
-        # the honest answer for material that does not hold more.
-        if len(shorts) < min_clips:
-            used = {str(s.get("source_window_id") or "") for s in shorts}
-            spare = [w for w in shortlist if w["id"] not in used]
-            if spare:
-                missing = min_clips - len(shorts)
-                print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
-                      f"asking the {len(spare)} unused window(s) for {missing} more.")
-                extra = _run_stage_split(
-                    client, model_name, spare,
-                    _detail_prompt_for(missing, max(missing, len(spare))),
-                    gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
-                if extra:
-                    shorts = sorted(shorts + extra,
-                                    key=lambda s: float(s.get("start") or 0))
-                    print(f"   Recovered {len(extra)} clip(s) from them.")
+        # Automatic hooks (auto_hooks.py): one closed-choice pass that judges
+        # each clip's opening, trims a lead-in to a beat boundary (never on a
+        # clip whose opening the check decided), picks a teaser beat and
+        # blends the hook score into predicted_score, so the trim / de-dupe /
+        # render order below rank by it. Never adds or drops a clip; any
+        # failure leaves the clips as the detail pass made them.
+        try:
+            print("   " + auto_hooks.run_pass(
+                shorts, words, _brief_runner(), brief=creator_brief.active_brief(),
+                batch=2 if llm_backend.active() else None, min_secs=min_secs))
+        except Exception as e:
+            print(f"   ⚠️ Hook pass skipped ({type(e).__name__}).")
 
         if len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
@@ -2207,34 +2524,71 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             shorts = trim_to_best(shorts, max_clips)
             print(f"   Kept the {max_clips} best-scoring clip(s) of "
                   f"{max_clips + dropped}.")
-        # Snap each proposed clip onto real word boundaries (+ a bit of silence).
+        # Context check (context_check.py) for clips without a record: on the
+        # window path every clip, on the idea path only clips whose earlier
+        # check failed or that matched no idea. After the hook pass, so a
+        # lead-in trim can never undo a repair (a repair that restores
+        # trimmed setup shrinks lead_in_trimmed), and after trim_to_best, so
+        # only kept clips cost a check. Never adds or drops a clip; any
+        # failure leaves the clips as they were.
+        try:
+            print("   " + context_check.run_pass(
+                shorts, pieces, boundary_run,
+                batch=2 if llm_backend.active() else None,
+                min_secs=min_secs, max_secs=max_secs, overrun=overrun,
+                skip_checked=True))
+        except Exception as e:
+            print(f"   ⚠️ Context check skipped ({type(e).__name__}).")
+
+        # Place each cut in the silence at the edge of the piece (or word)
+        # the models chose, inside the length band (snap_clip_to_pieces); the
+        # plain word snap when there are no pieces or nothing fits. A clip the
+        # check let run past the default max to finish its idea keeps that
+        # allowance (``over_max``); every other clip gets the exact band.
+        snapped = {}
         for s in shorts:
             # Keep the model's raw proposal: it is how boundary accuracy is
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
-            ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
-                                        min_duration=min_secs, max_duration=max_secs)
+            rec = s.get("context_check") if isinstance(s.get("context_check"), dict) else {}
+            top = max_secs + (overrun if rec.get("over_max") is not None else 0.0)
+            placed = snap_clip_to_pieces(
+                s.get("start", 0), s.get("end", 0), pieces, words, video_duration,
+                min_duration=min_secs, max_duration=top) if pieces else None
+            if placed is None:
+                ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words,
+                                            video_duration, min_duration=min_secs,
+                                            max_duration=top)
+                moved = False
+            else:
+                ns, ne, moved = placed
             s["start"], s["end"] = ns, ne
+            s["boundary"] = boundary_label(s, placed is not None)
+            if moved and s.get("piece_pick"):
+                s["band_fit"] = True      # an edge left the chosen one to fit the band
+            else:
+                s.pop("band_fit", None)
+            snapped[s["boundary"]] = snapped.get(s["boundary"], 0) + 1
+        if snapped:
+            print("   Cuts: " + ", ".join(f"{n} {k}" for k, n in sorted(snapped.items())) + ".")
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "
                   f"better-scored one.")
             shorts = deduped
 
-        # Aggregate cost across both passes.
-        cost_analysis = None
-        if costs:
-            cost_analysis = {
-                "input_tokens": sum(c.get("input_tokens", 0) for c in costs),
-                "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
-                "total_cost": sum(c.get("total_cost", 0) for c in costs),
-                "model": model_name,
-            }
-            print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
+        # Aggregate cost across every counted pass.
+        cost_analysis = _cost_summary(costs, model_name, boundary_model)
+        if cost_analysis:
+            share = (f", boundaries on {boundary_model}: "
+                     f"${cost_analysis['boundary_cost']:.6f}"
+                     if "boundary_model" in cost_analysis else "")
+            print(f"\U0001f4b0 Total cost ({model_name}{share}, {path}, "
+                  f"{len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
-            print("⚠️ 2-pass returned no clips.")
+            print(f"⚠️ Clip selection ({path}) returned no clips.")
             return None
 
         result = {"shorts": shorts}
@@ -2358,7 +2712,8 @@ def _visual_pass(client, model_name, video_path, duration, language,
         prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
             video_duration=duration, language=language,
             min_clips=min_clips, max_clips=max_clips,
-            min_secs=min_secs, max_secs=max_secs) + (hint or "")
+            min_secs=min_secs, max_secs=max_secs) + (hint or "") + creator_brief.prompt_block(
+                creator_brief.active_brief(), "visual")
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=gemini_worker.VisualResponse,
@@ -2585,6 +2940,8 @@ if __name__ == '__main__':
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
+        if not args.skip_analysis:
+            _activate_creator_brief(output_dir)  # before the early pick reads it
         input_video, video_title = download_youtube_video(
             args.url, output_dir, on_audio=_on_audio if use_early else None)
     else:
@@ -2606,6 +2963,8 @@ if __name__ == '__main__':
     if not os.path.exists(input_video):
         print(f"❌ Input file not found: {input_video}")
         exit(1)
+    if not args.skip_analysis:
+        _activate_creator_brief(output_dir)  # no-op when the URL branch did it
 
     # Quota-wall offer: only the first N minutes were paid for (see
     # cap_source_duration). Must run before anything reads the file.
@@ -2811,6 +3170,33 @@ if __name__ == '__main__':
                     # and title from three of its frames BEFORE burning them.
                     if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
+                    # Cold open (teaser.py): an automatic two-segment recut
+                    # [teaser, body] of the clean canonical; hook and captions
+                    # then go on the recut, captioned through its virtual
+                    # transcript. Any failure keeps the canonical clip.
+                    cap_transcript, cap_start, cap_end = transcript, start, end
+                    if (clip.get('recipe') or {}).get('teaser'):
+                        clip.pop('recipe', None)  # a retry re-plans from scratch
+                    if success:
+                        try:
+                            _segs = teaser.plan(clip, start, end)
+                            _teased = _segs and teaser.render(
+                                clip_final_path, clip, _segs, start, end,
+                                output_dir, clip_filename)
+                            if _teased:
+                                _caps_in = teaser.caption_inputs(transcript, _segs)
+                                deliver_path, clip['layout_ranges'] = _teased
+                                cap_transcript, cap_start, cap_end = _caps_in
+                                clip['recipe'] = teaser.recipe(_segs, start, end)
+                                print(f"   🎣 Teaser cold open: {teaser.teaser_seconds(clip):.1f}s "
+                                      f"replayed first")
+                        except Exception as e:
+                            print(f"   ⚠️ Teaser skipped ({type(e).__name__}).")
+                            deliver_path = clip_final_path
+                            clip['layout_ranges'] = _layouts.read(clip_final_path)
+                            clip.pop('recipe', None)
+                            cap_transcript, cap_start, cap_end = transcript, start, end
+                    hook_source = deliver_path
                     captioned = None
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])
                     if success and os.environ.get("AUTO_HOOK") == "1":
@@ -2818,9 +3204,9 @@ if __name__ == '__main__':
                         # outputs) when both are on; see auto_hook_clip.
                         plan = None
                         if (clip.get('viral_hook_text') or '').strip():
-                            plan = auto_caption_clip(clip_final_path, transcript, start, end,
+                            plan = auto_caption_clip(hook_source, cap_transcript, cap_start, cap_end,
                                                      split_ranges=split_ranges, plan_only=True)
-                        hooked = auto_hook_clip(clip_final_path, clip, captions=plan,
+                        hooked = auto_hook_clip(hook_source, clip, captions=plan,
                                                 mark=os.environ.get("WATERMARK") == "1")
                         if hooked:
                             deliver_path, clip['auto_hook'] = hooked
@@ -2828,7 +3214,7 @@ if __name__ == '__main__':
                     if success:
                         if not captioned:
                             captioned = auto_caption_clip(
-                                deliver_path, transcript, start, end,
+                                deliver_path, cap_transcript, cap_start, cap_end,
                                 split_ranges=split_ranges,
                                 mark=os.environ.get("WATERMARK") == "1")
                         served = captioned or deliver_path
@@ -2889,9 +3275,51 @@ if __name__ == '__main__':
                 except Exception as e:
                     print(f"   ❌ Clip {i+1} failed again: {type(e).__name__}: {e}")
 
+            # Creator brief post-check: a closed verdict per rendered clip,
+            # stored as clip['brief_check']. Annotates only; never fails or
+            # deletes a clip, never logs the brief.
+            if creator_brief.active_brief():
+                try:
+                    _d = creator_brief.active_directives()
+                    _done = [i for i in range(len(shorts)) if os.path.exists(
+                        os.path.join(output_dir, f"{video_title}_clip_{i+1}.mp4"))]
+                    _caps = (os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"
+                             and bool((transcript or {}).get('segments')))
+                    import subtitles as _subs
+                    _look = creator_brief.caption_style(_subs.AUTO_CAPTION_STYLE)
+                    _facts = [{
+                        "duration_seconds": round(float(shorts[i]['end']) - float(shorts[i]['start'])
+                                                  + teaser.teaser_seconds(shorts[i]), 2),
+                        "hook_text": (shorts[i].get('auto_hook') or {}).get('text') or None,
+                        "hook_seconds": (shorts[i].get('auto_hook') or {}).get('duration_seconds'),
+                        "captions": "on" if _caps else "off",
+                        "caption_preset": (_d["caption_preset"].replace("keep", "default")
+                                           if _caps else None),
+                        "caption_text_color": _look["font_color"] if _caps else None,
+                        "caption_highlight_color": _look["highlight_color"] if _caps else None,
+                        "caption_uppercase": bool(_look["uppercase"]) if _caps else None,
+                        "title": shorts[i].get('video_title_for_youtube_short') or "",
+                        "transcript": creator_brief.clip_transcript(
+                            transcript, shorts[i]['start'], shorts[i]['end']),
+                    } for i in _done]
+                    _verdicts = creator_brief.check_all(
+                        creator_brief.active_brief(), _facts, _brief_runner(), directives=_d)
+                    if _verdicts is not None:
+                        for i, v in zip(_done, _verdicts):
+                            shorts[i]['brief_check'] = v
+                        _counts = {}
+                        for v in _verdicts:
+                            _counts[v['verdict']] = _counts.get(v['verdict'], 0) + 1
+                        print("📝 Brief check: " + (", ".join(
+                            f"{n} {k}" for k, n in sorted(_counts.items())) or "no clips"))
+                except Exception as e:
+                    print(f"⚠️ Brief check skipped ({type(e).__name__}).")
+
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
+            if any('auto_hook' in c or 'hook_grounding' in c or 'brief_check' in c
+                   or 'recipe' in c or 'hook_score' in c or 'teaser_pick' in c
+                   for c in shorts):
                 # Atomic: the dashboard is already reading this file for the
                 # clips announced above (CLIP_READY).
                 write_json_atomic(metadata_file, clips_data, indent=2)

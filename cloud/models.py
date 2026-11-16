@@ -509,3 +509,19 @@ class FirstVideoGrant(Base):
     ip_hash = Column(String(64), nullable=False, index=True)
     job_id = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class BriefPreset(Base):
+    """A named, reusable set of creator instructions ("campaign X rules").
+
+    Its own table for the same reason as [ApiKey]: the schema bootstrap is
+    ``create_all``. Erased with the account (``account.USER_OWNED_TABLES``).
+    """
+    __tablename__ = "brief_presets"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    name = Column(Text, nullable=False)
+    brief = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())

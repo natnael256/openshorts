@@ -12,6 +12,7 @@ import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
 import TikTokDraftNotice from './TikTokDraftNotice';
 import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
+import { VerdictBadge, HookInfo } from './ClipHistory';
 
 const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 sm:py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
 
@@ -877,6 +878,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     <h3 className="text-base font-medium text-ink leading-tight line-clamp-2 mb-2 break-words" title={clip.video_title_for_youtube_short}>
                         {clip.video_title_for_youtube_short || "Viral Clip Generated"}
                     </h3>
+                    <VerdictBadge check={clip.brief_check} />
+                    <HookInfo score={clip.hook_score} type={clip.hook_type} teaser={clip.recipe?.teaser === true} />
                     {/* The score alone says how much, not why. One line from
                         the selection pass on what this moment has going for it. */}
                     {clip.why && (

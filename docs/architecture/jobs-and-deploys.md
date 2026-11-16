@@ -160,6 +160,79 @@ parakeet text.
   dashboard shows it with a "paid plans skip the line" upsell (paid plans do
   dispatch first: `PLAN_PRIORITY`).
 
+## Manual retry (`job_retry.py`, `POST /api/jobs/{job_id}/retry`)
+
+A failed (or lost) clip job can be run again by the user under the same job id,
+without re-entering anything. Two dotfile sidecars in the job directory make it
+possible (`/videos` never serves dot segments):
+
+- **`.submit.json`** (`job_retry.write_submit`, written by `/api/process` right
+  after the resume manifest): the argv, the allow-listed per-job settings
+  (`job_retry.SETTING_KEYS`: the `layout_env` flags, `AUTO_HOOK`,
+  `AUTO_HOOK_STYLE`, `AUTO_TEASER`, `AUTO_CAPTIONS`, `CLIP_TARGET_MIN/MAX`,
+  `CLIP_MIN/MAX_SECONDS`, an allow-listed `GEMINI_MODEL`; only the values the
+  job changed from the server's own env), priority, webhook URL, partial cut,
+  source cap, skip-statics, the reservation id and the manual-retry counter.
+- **`.failed.json`** (`run_job_wrapper`, terminal path): the failure's code from
+  `job_retry.classify_failure` (closed set: `missing_key`, `download_blocked`,
+  `video_unavailable`, `no_clips`, `no_audio`, `content_blocked`, `too_short`,
+  `model_overloaded`, `model_unavailable`, `out_of_memory`, `server_restarted`,
+  `quota`, `unknown`), so the reason survives a restart. The message is fixed per
+  code, never a log line. A completed run removes it. `model_unavailable` is
+  Gemini's 404 for a retired model; it is matched before `video_unavailable`,
+  whose markers are phrased as YouTube words them so an AI-side "no longer
+  available" never blames the video.
+- A `GEMINI_MODEL` off `app.GEMINI_MODEL_CHOICES` (request header, stored
+  `.submit.json`, or the dashboard's remembered choice) is dropped and the job
+  runs on the default model, so a job stored with a retired model succeeds on
+  retry.
+
+**Never persisted** in either: the Gemini key (the retry request brings it, as
+`/api/process` does: `resolve_gemini`), proxy URLs, cookies, any other
+credential, the webhook secret (a retried job keeps its HMAC secret only while
+the failed record is still in memory; after a restart it is delivered unsigned),
+and the creator brief (it stays in `.brief.json` and main.py reads it there, as
+on the first run; the retry endpoint accepts no brief).
+
+**Retry rules.** Only a `failed` job (in memory) or a lost one (a directory
+with `.submit.json`, no manifest, no metadata, not in memory: `/api/status`
+answers it as `failed` with `lost: true` instead of 404) that is not active
+(`_job_is_active`). The stored argv runs only if `job_retry.cmd_is_safe`
+accepts it (exactly what `/api/process` builds; `-o` this job's directory, `-i`
+a `<job_id>_*` file directly in `uploads/`) and with the interpreter rebuilt
+as `sys.executable`. At most `MANUAL_RETRY_LIMIT` (5) retries per job, counted
+in `.submit.json` (429 past it). An in-process guard makes two simultaneous
+requests for one job enqueue it once (the second gets 409). Upload jobs need
+their file in `uploads/` (409 `source_missing` once the upload sweep took it).
+URL jobs download again: main.py deletes and re-downloads an existing
+`<title>.mp4` (`download_youtube_video` removes `expected` before yt-dlp, with
+`overwrites`), so a kept source is not reused; the transcript checkpoint is.
+
+**What is reused**: the job id and directory, the source upload, the transcript
+checkpoint, `.owner`, `.brief.json`, `.submit.json`. `_clean_for_retry` drops
+the half-made outputs, and the manual retry also drops `.failed.json` and
+`.brief_applied.json`. The new record starts with `auto_retries` 0, so a
+transient failure of the retry still gets its one automatic retry.
+
+**Billing.** A failed job's reservation is released by `_settle_reservation`
+(it commits only on `completed`). The retry reserves again through the same
+`reserve_process_minutes` as `/api/process` (job limit, balance, probe), with
+the stored partial (`max_minutes`) or chosen range (`source_range`), so a cloud
+user is neither charged twice nor given a free run. Before reserving it calls
+`release_reservation` on the old id (memory record or `.submit.json`): a no-op
+for a row that is not `reserved` any more, and the guarantee that a reservation
+somehow still held is returned rather than doubled. A 402/429 from the
+reservation leaves the job untouched (still failed, counter not bumped,
+nothing cleaned). The watermark follows the user's current plan. The quality
+gate does not run again.
+
+**Resume now re-applies settings.** `_resume_interrupted_jobs` used to rebuild
+the child env from `child_env()` and the manifest only, so a resumed job lost
+its layouts, hook, clip controls and model. It now applies `.submit.json`'s
+settings first (`_apply_submit_settings`, re-validated). It still cannot bring
+back a BYOK key that came in a header: a resumed self-host job without a
+server key fails with `missing_key`, and the manual retry is the way out.
+
 ## Deploys and running jobs (handover + drain)
 
 Every push to `main` redeploys the API container as a rolling update: the NEW
@@ -195,3 +268,18 @@ coordinates them:
 
 Every deploy is a full build plus a handover, so batch small commits (tests,
 docs) with the next real change.
+
+## History retention
+
+Self-host keeps every completed clip job (a job directory holding a
+`*_metadata.json`, what History lists) until the user deletes it:
+`_sweep_expired_job_dirs` skips it and `_enforce_output_size_cap` never picks it
+(`KEEP_HISTORY`, on when `BILLING_ENABLED` is off; `HISTORY_KEEP=0` restores the
+old `JOB_RETENTION_SECONDS` clock). The `OUTPUT_MAX_GB` cap stays the only cap:
+for kept jobs it becomes the "storage full" warning of `GET /api/storage`
+instead of a trim. Still aging out as before: failed jobs (no metadata, or a
+`failed` record), SaaSShorts and scratch directories, and source uploads in
+`uploads/` (`_sweep_expired_uploads` and its cap are unchanged: an uploaded
+source file still ages out, while a URL job's downloaded source lives in the job
+directory and is kept with it). Cloud is unchanged (1 h clock, clips in R2).
+Deleting from History removes the local copy only.

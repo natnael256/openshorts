@@ -3,6 +3,14 @@ import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
+import BriefField from './BriefField';
+import { briefHints } from '../lib/briefHints';
+
+// Muted note next to a control the instruction text already speaks to.
+function InstructionNote({ show, text = 'set by your instructions', title = 'your instructions mention this; they take priority over this setting' }) {
+    if (!show) return null;
+    return <span className="text-[11px] text-muted lowercase" title={title}>{text}</span>;
+}
 
 const SUPPORTED_PLATFORMS = [
     'YouTube', 'Vimeo', 'TikTok', 'X / Twitter', 'Twitch', 'Kick',
@@ -54,6 +62,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [autoHook, setAutoHook] = useState(() => {
         try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
     });
+    // Cold open: replay the most gripping moment first. On unless switched off.
+    const [teaser, setTeaser] = useState(() => {
+        try { return localStorage.getItem('os_teaser') !== '0'; } catch { return true; }
+    });
     const [autoHookStyle, setAutoHookStyle] = useState(() => {
         // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
         try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
@@ -64,7 +76,14 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
+    // Creator instructions + the saved preset they were loaded from (if any).
+    const [brief, setBrief] = useState(() => {
+        try { return localStorage.getItem('os_brief_draft') || ''; } catch { return ''; }
+    });
+    const [briefPresetId, setBriefPresetId] = useState(null);
+    const [briefPresetText, setBriefPresetText] = useState(null);
     const infoRef = useRef(null);
+    const hints = briefHints(brief);
 
     // Close the compatibility popover on any outside click.
     useEffect(() => {
@@ -126,13 +145,18 @@ export default function MediaInput({ onProcess, isProcessing }) {
             clipMaxSeconds: clipMaxSeconds || null,
             autoHook,
             autoHookStyle,
+            teaser: teaser ? undefined : false,
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
+            brief: brief.trim() || null,
+            // Only when the text is exactly the saved preset's, unmodified.
+            briefPresetId: briefPresetId && briefPresetText != null && brief.trim() === briefPresetText.trim() ? briefPresetId : null,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
+            localStorage.setItem('os_teaser', teaser ? '1' : '0');
             localStorage.setItem('os_layout', layout);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
@@ -303,6 +327,15 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 </div>
 
+                <BriefField
+                    value={brief}
+                    onChange={setBrief}
+                    presetId={briefPresetId}
+                    onPresetChange={setBriefPresetId}
+                    onPresetText={setBriefPresetText}
+                    disabled={isProcessing}
+                />
+
                 {/* Advanced generation controls — collapsed by default; blank = AI decides */}
                 <div className="mt-4">
                     <button
@@ -312,7 +345,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
+                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook || !teaser) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
@@ -332,6 +365,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             </div>
                             <div>
                                 <p className="eyebrow mb-1.5">min length (s)</p>
+                                {hints.clipLength && (
+                                    <p className="mb-1.5"><InstructionNote show text="a number here overrides your instructions" title="your instructions mention a clip length; a number typed here still wins over them" /></p>
+                                )}
                                 <input
                                     type="number" min="5" max="175" step="1"
                                     value={clipMinSeconds}
@@ -342,6 +378,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             </div>
                             <div>
                                 <p className="eyebrow mb-1.5">max length (s)</p>
+                                {hints.clipLength && (
+                                    <p className="mb-1.5"><InstructionNote show text="a number here overrides your instructions" title="your instructions mention a clip length; a number typed here still wins over them" /></p>
+                                )}
                                 <input
                                     type="number" min="10" max="180" step="1"
                                     value={clipMaxSeconds}
@@ -378,6 +417,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     />
                                     auto hook titles on clips
                                 </label>
+                                <InstructionNote show={hints.hook} />
                                 {autoHook && (
                                     <select
                                         value={autoHookStyle}
@@ -393,12 +433,28 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                         <option value="outline_yellow">Outline+</option>
                                     </select>
                                 )}
+                                {autoHook && <InstructionNote show={hints.hookStyle} />}
                                 {autoHook && (
                                     <p className="w-full text-[11px] leading-relaxed text-muted">
                                         You can change each clip&apos;s hook text, style, position and size
                                         afterwards with its hook button.
                                     </p>
                                 )}
+                            </div>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={teaser}
+                                        onChange={(e) => setTeaser(e.target.checked)}
+                                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                                    />
+                                    cold open (teaser)
+                                </label>
+                                <InstructionNote show={hints.teaser} />
+                                <p className="w-full text-[11px] leading-relaxed text-muted">
+                                    opens each clip with its most gripping moment, then plays it from the start
+                                </p>
                             </div>
                         </div>
                     )}
