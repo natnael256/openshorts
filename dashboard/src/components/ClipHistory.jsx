@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Loader2, Download, Film, ChevronDown, Trash2, RotateCcw } from 'lucide-react';
+import { Loader2, Download, Film, ChevronDown, Trash2, RotateCcw, Copy, Check } from 'lucide-react';
+import { copyText } from '../lib/clipboard';
 import { apiJson, apiFetch, QuotaError, openQuotaWall } from '../lib/api';
 import { retryJob } from '../lib/jobRetry';
 import { getApiUrl } from '../config';
@@ -209,6 +210,22 @@ function FailedRow({ f, apiKey, geminiModel, onRetried }) {
     );
 }
 
+// One click to copy the clip's title as the post caption.
+function CopyCaption({ text }) {
+    const [copied, setCopied] = useState(false);
+    const copy = async () => {
+        if (await copyText(text)) {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+        }
+    };
+    return (
+        <button type="button" onClick={copy} className="mt-2 mr-3 text-micro font-mono uppercase text-brass hover:text-ink inline-flex items-center gap-1 transition-colors" title="Copy the title to paste as the caption">
+            {copied ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Caption</>}
+        </button>
+    );
+}
+
 function SourceEntry({ s, onJobDeleted, onClipDeleted }) {
     const [open, setOpen] = useState(false);
     // 'job' | clip index | null: which delete is awaiting confirmation.
@@ -324,6 +341,7 @@ function SourceEntry({ s, onJobDeleted, onClipDeleted }) {
                                 </p>
                                 <VerdictBadge check={c.brief_check} />
                                 <HookInfo score={c.hook_score} type={c.hook_type} teaser={c.teaser} />
+                                {c.title ? <CopyCaption text={c.title} /> : null}
                                 {c.video_url ? (
                                     <a
                                         href={dl}

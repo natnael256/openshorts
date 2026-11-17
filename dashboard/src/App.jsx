@@ -26,6 +26,7 @@ import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
 import ClipHistory from './components/ClipHistory';
+import LibraryFiles from './components/LibraryFiles';
 import StorageBanner from './components/StorageBanner';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
@@ -2170,6 +2171,7 @@ function App() {
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
+                {!billingEnabled && <LibraryFiles />}
                 <ClipHistory apiKey={apiKey} geminiModel={geminiModel} onRetried={handleHistoryRetried} />
                 {billingEnabled && <HistoryTab onReopenProject={restoreProject} />}
               </div>

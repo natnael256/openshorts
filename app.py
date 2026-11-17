@@ -4310,6 +4310,48 @@ async def storage_endpoint():
     return storage_usage.report(used, OUTPUT_MAX_GB * 1024 ** 3, KEEP_HISTORY)
 
 
+# --- My files: read-only library of finished clips (self-host only) -----------
+class LibraryPostedRequest(BaseModel):
+    path: str
+    posted: bool = True
+
+
+@app.get("/api/library")
+async def library_list():
+    """Videos in LIBRARY_DIR (one folder deep) with their caption and posted tick."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    import media_library
+    return await asyncio.get_event_loop().run_in_executor(None, media_library.listing)
+
+
+@app.get("/api/library/file")
+async def library_file(path: str, download: bool = False):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    import media_library
+    try:
+        full = media_library.resolve(path)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+    name = os.path.basename(full)
+    return FileResponse(full, media_type="video/mp4",
+                        filename=name if download else None,
+                        content_disposition_type="attachment" if download else "inline")
+
+
+@app.post("/api/library/posted")
+async def library_posted(req: LibraryPostedRequest):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    import media_library
+    try:
+        media_library.set_posted(req.path, req.posted)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"ok": True}
+
+
 async def _history_job_for_delete(job_id: str, request: Request):
     """The completed, idle, caller-owned job a History delete may act on."""
     if not _is_uuid_id(job_id):

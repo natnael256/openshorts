@@ -52,3 +52,7 @@ CLAUDE.local.md
 
 # Rust build output
 osrender/target/
+
+# Self-host "My files" library and its posted ticks (local data, never committed)
+library/
+data/
